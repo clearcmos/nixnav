@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+import socket, os, sys
+sock_path = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "nixnav.sock")
+try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(0.5)
+    s.connect(sock_path)
+    s.send(b"toggle")
+    s.close()
+except:
+    sys.exit(1)
