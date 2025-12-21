@@ -41,7 +41,7 @@ class Config:
                 {"name": "Home", "path": str(Path.home())},
             ],
             "last_bookmark": 0,
-            "last_mode": "files",
+            "last_mode": "edit",
             "exclude_patterns": ["*.pyc", "__pycache__", ".git", "node_modules", "*.log"],
             "max_results": 500,
         }
@@ -76,6 +76,19 @@ class FileScanner(QObject):
     results_ready = Signal(list)
     finished = Signal()
 
+    # Binary/non-editable file extensions to exclude in edit mode
+    BINARY_EXTENSIONS = [
+        "*.png", "*.jpg", "*.jpeg", "*.gif", "*.bmp", "*.ico", "*.webp", "*.svg",
+        "*.mp3", "*.mp4", "*.wav", "*.avi", "*.mkv", "*.mov", "*.flac", "*.ogg",
+        "*.pdf", "*.doc", "*.docx", "*.xls", "*.xlsx", "*.ppt", "*.pptx",
+        "*.zip", "*.tar", "*.gz", "*.bz2", "*.xz", "*.7z", "*.rar",
+        "*.exe", "*.dll", "*.so", "*.dylib", "*.a", "*.o", "*.obj",
+        "*.bin", "*.dat", "*.db", "*.sqlite", "*.sqlite3",
+        "*.ttf", "*.otf", "*.woff", "*.woff2", "*.eot",
+        "*.class", "*.jar", "*.war", "*.pyc", "*.pyo", "*.whl",
+        "*.min.js", "*.min.css",  # Minified files aren't pleasant to edit
+    ]
+
     def __init__(self, root_path: str, mode: str, query: str, exclude_patterns: list, max_results: int):
         super().__init__()
         self.root_path = root_path
@@ -101,14 +114,19 @@ class FileScanner(QObject):
             cmd = ["fd", "--color=never", "--absolute-path"]
 
             # Type filter
-            if self.mode == "folders":
+            if self.mode == "gotodir":
                 cmd.extend(["--type", "d"])
-            else:  # files
+            else:  # edit or gotofile - search files
                 cmd.extend(["--type", "f"])
 
             # Exclude patterns
             for pattern in self.exclude_patterns:
                 cmd.extend(["--exclude", pattern])
+
+            # For edit mode, also exclude binary files
+            if self.mode == "edit":
+                for pattern in self.BINARY_EXTENSIONS:
+                    cmd.extend(["--exclude", pattern])
 
             # Max results
             cmd.extend(["--max-results", str(self.max_results)])
@@ -132,7 +150,7 @@ class FileScanner(QObject):
                 return
 
             # Parse results
-            is_dir = (self.mode == "folders")
+            is_dir = (self.mode == "gotodir")
             for line in stdout.strip().split('\n'):
                 if not line:
                     continue
@@ -154,88 +172,6 @@ class FileScanner(QObject):
         self.finished.emit()
 
 
-class GrepScanner(QObject):
-    """Fast content scanner using ripgrep."""
-    results_ready = Signal(list)
-    finished = Signal()
-
-    def __init__(self, root_path: str, query: str, exclude_patterns: list, max_results: int):
-        super().__init__()
-        self.root_path = root_path
-        self.query = query
-        self.exclude_patterns = exclude_patterns
-        self.max_results = max_results
-        self._cancelled = False
-        self._process = None
-
-    def cancel(self):
-        self._cancelled = True
-        if self._process:
-            try:
-                self._process.kill()
-            except:
-                pass
-
-    def run(self):
-        results = []
-        try:
-            # Build rg command
-            cmd = [
-                "rg", "--color=never", "--line-number", "--no-heading",
-                "--max-count=5",  # Max 5 matches per file
-                "--max-filesize=1M",  # Skip large files
-                "-i",  # Case insensitive
-            ]
-
-            # Exclude patterns
-            for pattern in self.exclude_patterns:
-                cmd.extend(["--glob", f"!{pattern}"])
-
-            cmd.append(self.query)
-            cmd.append(self.root_path)
-
-            # Run rg
-            self._process = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
-            )
-            stdout, _ = self._process.communicate(timeout=10)
-
-            if self._cancelled:
-                return
-
-            # Parse results: path:line_num:content
-            file_matches = {}
-            for line in stdout.strip().split('\n'):
-                if not line or ':' not in line:
-                    continue
-                try:
-                    # Format: /path/to/file:123:matching line content
-                    parts = line.split(':', 2)
-                    if len(parts) >= 3:
-                        path, line_num, content = parts[0], int(parts[1]), parts[2]
-                        if path not in file_matches:
-                            file_matches[path] = []
-                        if len(file_matches[path]) < 5:
-                            file_matches[path].append((line_num, content.strip()[:120]))
-                except:
-                    pass
-
-                if len(file_matches) >= self.max_results:
-                    break
-
-            results = [(path, matches) for path, matches in file_matches.items()]
-
-        except subprocess.TimeoutExpired:
-            if self._process:
-                self._process.kill()
-        except Exception as e:
-            pass
-
-        if not self._cancelled:
-            self.results_ready.emit(results)
-        self.finished.emit()
-
-
 class NixNavWindow(QWidget):
     closed = Signal()
 
@@ -244,18 +180,29 @@ class NixNavWindow(QWidget):
         self.config = config
         self._scanner_thread: Optional[QThread] = None
         self._scanner = None
-        self._grep_scanner = None
         self._results_data = []  # Store (path, is_dir, matches) for each item
 
         self.setWindowTitle("NixNav")
         self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
-        self.resize(1000, 650)
+
+        # Restore window size from config or use defaults
+        geo = self.config.data.get("window_geometry")
+        if geo and isinstance(geo, str):
+            from PySide6.QtCore import QByteArray
+            # restoreGeometry handles size; position won't work on Wayland
+            self.restoreGeometry(QByteArray.fromBase64(geo.encode()))
+        else:
+            self.resize(1000, 650)
+
         self.setup_ui()
         self.setup_shortcuts()
 
     def closeEvent(self, event):
-        """Clean up threads on close."""
+        """Clean up threads and save position on close."""
         self._cancel_scan()
+        # Save window geometry (as base64 bytes for Qt's native format)
+        self.config.data["window_geometry"] = self.saveGeometry().toBase64().data().decode()
+        self.config.save()
         super().closeEvent(event)
 
     def setup_ui(self):
@@ -267,17 +214,22 @@ class NixNavWindow(QWidget):
         top = QHBoxLayout()
         top.setSpacing(8)
 
-        # Mode buttons - compact
+        # Mode buttons
         self.mode_buttons = []
-        for label, mode in [("F", "files"), ("D", "folders"), ("S", "grep")]:
+        modes = [
+            ("Edit", "edit", "Edit file in Kate"),
+            ("File", "gotofile", "Go to file's folder in Dolphin"),
+            ("Dir", "gotodir", "Go to folder in Dolphin"),
+        ]
+        for label, mode, tooltip in modes:
             btn = QPushButton(label)
             btn.setCheckable(True)
             btn.setProperty("mode", mode)
-            btn.setFixedWidth(32)
-            btn.setToolTip({"F": "Files", "D": "Directories", "S": "Search contents"}[label])
+            btn.setMinimumWidth(50)
+            btn.setToolTip(tooltip)
             btn.clicked.connect(lambda _, m=mode: self.set_mode(m))
             btn.setStyleSheet("""
-                QPushButton { background: #333; color: #888; border: none; padding: 4px; border-radius: 3px; font-weight: bold; }
+                QPushButton { background: #333; color: #888; border: none; padding: 4px 8px; border-radius: 3px; font-weight: bold; }
                 QPushButton:checked { background: #5c9ae6; color: #fff; }
                 QPushButton:hover:!checked { background: #444; }
             """)
@@ -350,7 +302,7 @@ class NixNavWindow(QWidget):
         layout.addWidget(self.splitter, 1)
 
         # Help line
-        help_lbl = QLabel("Enter: Open | Ctrl+O: Open folder | Tab: Mode | Esc: Close")
+        help_lbl = QLabel("Enter: Open | Tab: Mode | Esc: Close")
         help_lbl.setStyleSheet("color: #444; font-size: 10px;")
         help_lbl.setAlignment(Qt.AlignCenter)
         layout.addWidget(help_lbl)
@@ -398,7 +350,12 @@ class NixNavWindow(QWidget):
         self.bookmark_combo.blockSignals(False)
 
     def _set_mode_from_config(self):
-        mode = self.config.data.get("last_mode", "files")
+        mode = self.config.data.get("last_mode", "edit")
+        # Handle old config values
+        if mode in ("files", "grep"):
+            mode = "edit"
+        elif mode == "folders":
+            mode = "gotodir"
         self.set_mode(mode)
 
     def set_mode(self, mode: str):
@@ -406,18 +363,22 @@ class NixNavWindow(QWidget):
             btn.setChecked(btn.property("mode") == mode)
         self.config.data["last_mode"] = mode
         self.config.save()
-        placeholders = {"files": "> Search files...", "folders": "> Search folders...", "grep": "> Search contents (min 2 chars)..."}
+        placeholders = {
+            "edit": "> Search files to edit...",
+            "gotofile": "> Search files...",
+            "gotodir": "> Search folders...",
+        }
         self.search.setPlaceholderText(placeholders.get(mode, "> Search..."))
         self._refresh()
 
     def _cycle_mode(self):
-        modes = ["files", "folders", "grep"]
-        current = self.config.data.get("last_mode", "files")
+        modes = ["edit", "gotofile", "gotodir"]
+        current = self.config.data.get("last_mode", "edit")
         try:
             idx = modes.index(current)
             self.set_mode(modes[(idx + 1) % len(modes)])
         except:
-            self.set_mode("files")
+            self.set_mode("edit")
 
     def _on_bookmark_changed(self, idx):
         self.config.data["last_bookmark"] = idx
@@ -442,7 +403,7 @@ class NixNavWindow(QWidget):
         return self.bookmark_combo.itemData(idx) if idx >= 0 else str(Path.home())
 
     def _get_mode(self) -> str:
-        return self.config.data.get("last_mode", "files")
+        return self.config.data.get("last_mode", "edit")
 
     def _on_search_changed(self, text: str):
         if hasattr(self, '_timer'):
@@ -451,41 +412,31 @@ class NixNavWindow(QWidget):
             self._timer = QTimer()
             self._timer.setSingleShot(True)
             self._timer.timeout.connect(self._refresh)
-        delay = 250 if self._get_mode() == "grep" else 100
-        self._timer.start(delay)
+        self._timer.start(100)
 
     def _cancel_scan(self):
         if self._scanner:
             self._scanner.cancel()
-            self._scanner = None
-        if self._grep_scanner:
-            self._grep_scanner.cancel()
-            self._grep_scanner = None
         if self._scanner_thread:
             if self._scanner_thread.isRunning():
                 self._scanner_thread.quit()
                 self._scanner_thread.wait(2000)
+            self._scanner_thread.deleteLater()
             self._scanner_thread = None
+        if self._scanner:
+            self._scanner.deleteLater()
+            self._scanner = None
 
     def _refresh(self):
         self._cancel_scan()
-        self.list.clear()
-        self._results_data.clear()
-        self.preview.clear()
+        # Don't clear list/preview here - wait until results arrive to avoid flash
 
         query = self.search.text().strip()
         root = self._get_path()
         mode = self._get_mode()
 
         self.status.setText("...")
-
-        if mode == "grep":
-            if len(query) < 2:
-                self.status.setText("type 2+ chars")
-                return
-            self._start_grep(root, query)
-        else:
-            self._start_scan(root, mode, query)
+        self._start_scan(root, mode, query)
 
     def _start_scan(self, root: str, mode: str, query: str):
         self._scanner_thread = QThread()
@@ -498,50 +449,26 @@ class NixNavWindow(QWidget):
         self._scanner.finished.connect(self._scanner_thread.quit)
         self._scanner_thread.start()
 
-    def _start_grep(self, root: str, query: str):
-        self._scanner_thread = QThread()
-        self._grep_scanner = GrepScanner(root, query,
-                                         self.config.data.get("exclude_patterns", []),
-                                         self.config.data.get("max_results", 100))
-        self._grep_scanner.moveToThread(self._scanner_thread)
-        self._scanner_thread.started.connect(self._grep_scanner.run)
-        self._grep_scanner.results_ready.connect(self._on_grep_results)
-        self._grep_scanner.finished.connect(self._scanner_thread.quit)
-        self._scanner_thread.start()
-
     def _on_file_results(self, results: list):
         results.sort(key=lambda x: x[2], reverse=True)  # Sort by mtime
         root = self._get_path()
+
+        # Batch updates to prevent visual flash
+        self.list.setUpdatesEnabled(False)
+        self.list.clear()
+        self._results_data.clear()
+
         for path, is_dir, mtime in results:
             # Show relative path if under root
             try:
                 rel = str(Path(path).relative_to(root))
             except:
                 rel = path
-            prefix = "" if is_dir else ""
-            item = QListWidgetItem(f"{prefix} {rel}")
+            item = QListWidgetItem(rel)
             self.list.addItem(item)
             self._results_data.append((path, is_dir, None))
 
-        self.status.setText(str(len(results)))
-        if self.list.count() > 0:
-            self.list.setCurrentRow(0)
-
-    def _on_grep_results(self, results: list):
-        root = self._get_path()
-        for path, matches in results:
-            try:
-                rel = str(Path(path).relative_to(root))
-            except:
-                rel = path
-            # Show first match
-            first_match = matches[0] if matches else (0, "")
-            line_num, line = first_match
-            display = f" {rel}:{line_num}"
-            item = QListWidgetItem(display)
-            self.list.addItem(item)
-            self._results_data.append((path, False, matches))
-
+        self.list.setUpdatesEnabled(True)
         self.status.setText(str(len(results)))
         if self.list.count() > 0:
             self.list.setCurrentRow(0)
@@ -577,11 +504,17 @@ class NixNavWindow(QWidget):
         row = self.list.currentRow()
         if 0 <= row < len(self._results_data):
             path, is_dir, _ = self._results_data[row]
+            mode = self._get_mode()
             try:
-                if is_dir:
-                    subprocess.Popen(["dolphin", path], start_new_session=True)
-                else:
+                if mode == "edit":
+                    # Open file in Kate
                     subprocess.Popen(["kate", path], start_new_session=True)
+                elif mode == "gotofile":
+                    # Open containing folder in Dolphin, with file selected
+                    subprocess.Popen(["dolphin", "--select", path], start_new_session=True)
+                elif mode == "gotodir":
+                    # Open folder in Dolphin
+                    subprocess.Popen(["dolphin", path], start_new_session=True)
                 self.close()
                 self.closed.emit()
             except Exception as e:
@@ -700,17 +633,17 @@ class NixNavApp(QObject):
         self.tray_menu.addAction(open_action)
         self.tray_menu.addSeparator()
 
-        files_action = QAction("Files", self.tray_menu)
-        files_action.triggered.connect(lambda: self._show_mode("files"))
-        self.tray_menu.addAction(files_action)
+        edit_action = QAction("Edit File", self.tray_menu)
+        edit_action.triggered.connect(lambda: self._show_mode("edit"))
+        self.tray_menu.addAction(edit_action)
 
-        folders_action = QAction("Folders", self.tray_menu)
-        folders_action.triggered.connect(lambda: self._show_mode("folders"))
-        self.tray_menu.addAction(folders_action)
+        gotofile_action = QAction("Go to File", self.tray_menu)
+        gotofile_action.triggered.connect(lambda: self._show_mode("gotofile"))
+        self.tray_menu.addAction(gotofile_action)
 
-        search_action = QAction("Search", self.tray_menu)
-        search_action.triggered.connect(lambda: self._show_mode("grep"))
-        self.tray_menu.addAction(search_action)
+        gotodir_action = QAction("Go to Folder", self.tray_menu)
+        gotodir_action.triggered.connect(lambda: self._show_mode("gotodir"))
+        self.tray_menu.addAction(gotodir_action)
 
         self.tray_menu.addSeparator()
         quit_action = QAction("Quit", self.tray_menu)
@@ -726,6 +659,20 @@ class NixNavApp(QObject):
             self.show_window()
 
     def show_window(self):
+        # Restore window size (position is handled by centering on Wayland)
+        geo = self.config.data.get("window_geometry")
+        if geo and isinstance(geo, str):
+            from PySide6.QtCore import QByteArray
+            self.window.restoreGeometry(QByteArray.fromBase64(geo.encode()))
+
+        # Center on screen (works reliably on Wayland, predictable UX)
+        screen = self.app.primaryScreen()
+        if screen:
+            screen_geo = screen.availableGeometry()
+            x = screen_geo.x() + (screen_geo.width() - self.window.width()) // 2
+            y = screen_geo.y() + (screen_geo.height() - self.window.height()) // 2
+            self.window.move(x, y)
+
         self.window.show()
         self.window.raise_()
         self.window.activateWindow()

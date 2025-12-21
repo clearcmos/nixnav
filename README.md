@@ -1,17 +1,18 @@
 # NixNav
 
-Fast, keyboard-centric file navigator for NixOS/KDE Wayland. GUI equivalent of fzf-powered `fcd`, `fcat`, `fgrep` terminal commands.
+Fast, keyboard-centric file navigator for NixOS/KDE Wayland. GUI equivalent of fzf-powered `fcd`, `fcat` terminal commands.
 
 ![NixNav Icon](nixnav.svg)
 
 ## Features
 
-- **Lightning fast** - Uses `fd` and `ripgrep` (Rust) for sub-second searches across large codebases
-- **Three modes** - Files, Folders, Search (grep) - switchable with Tab
+- **Lightning fast** - Uses `fd` (Rust) for sub-second searches across large codebases
+- **Three modes** - Edit, File, Dir - switchable with Tab
 - **Live preview** - Right panel shows file contents as you navigate
 - **System tray** - Runs in background, toggle with global hotkey
 - **Keyboard-centric** - Arrow keys, Enter to open, Esc to close
 - **Configurable bookmarks** - Quick access to frequently searched directories
+- **Wayland native** - Works on KDE Plasma Wayland, centers on screen each toggle
 
 ## Installation
 
@@ -48,9 +49,9 @@ nix run
 | Key | Action |
 |-----|--------|
 | `Arrow Up/Down` | Navigate results |
-| `Enter` | Open file (Kate) or folder (Dolphin) |
+| `Enter` | Execute action (depends on mode) |
 | `Ctrl+O` | Open containing folder |
-| `Tab` | Cycle modes: Files → Folders → Search |
+| `Tab` | Cycle modes: Edit → File → Dir |
 | `Esc` | Close/hide window |
 
 ### Global Toggle
@@ -61,11 +62,11 @@ Configure `nixnav-toggle` as a global shortcut (e.g., `Meta+F`) in KDE System Se
 
 ### Modes
 
-| Mode | What it searches | Opens with |
-|------|------------------|------------|
-| Files | File names | Kate |
-| Folders | Directory names | Dolphin |
-| Search | File contents (grep) | Kate (at match line) |
+| Mode | Button | What it searches | Enter action |
+|------|--------|------------------|--------------|
+| Edit | `Edit` | Text files (excludes binaries) | Open file in Kate |
+| File | `File` | All files | Open containing folder in Dolphin |
+| Dir | `Dir` | Directories | Open folder in Dolphin |
 
 ## Configuration
 
@@ -87,7 +88,6 @@ Config stored at `~/.config/nixnav/config.json`:
 - Python 3.12+
 - PySide6 (Qt6)
 - fd (file finder)
-- ripgrep (content search)
 - Kate (file editor)
 - Dolphin (file manager)
 

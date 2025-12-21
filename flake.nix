@@ -49,6 +49,8 @@
         devShells.default = pkgs.mkShell {
           buildInputs = [
             pythonEnv
+            pkgs.fd
+            pkgs.ripgrep
             # kate and dolphin already installed system-wide
           ];
 
