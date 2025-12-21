@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
+  <!-- Folder base -->
+  <path d="M6 12h14l4 4h18a2 2 0 0 1 2 2v22a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V14a2 2 0 0 1 2-2z" fill="#5294e2"/>
+  <path d="M6 16h36v22a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V18a2 2 0 0 1 2-2z" fill="#6ba4ec"/>
+  <!-- Compass rose -->
+  <g transform="translate(24, 28)">
+    <circle r="10" fill="#1a1a2e" opacity="0.9"/>
+    <circle r="8" fill="none" stroke="#5294e2" stroke-width="0.5"/>
+    <!-- N pointer (cyan/teal) -->
+    <polygon points="0,-7 2,-1 0,0 -2,-1" fill="#00d4aa"/>
+    <!-- S pointer (orange) -->
+    <polygon points="0,7 2,1 0,0 -2,1" fill="#ff6b35"/>
+    <!-- E pointer -->
+    <polygon points="7,0 1,2 0,0 1,-2" fill="#5294e2"/>
+    <!-- W pointer -->
+    <polygon points="-7,0 -1,2 0,0 -1,-2" fill="#5294e2"/>
+    <!-- Center dot -->
+    <circle r="1.5" fill="#ffffff"/>
+  </g>
+</svg>

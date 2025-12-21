@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=NixNav
+Comment=Fast file navigator for NixOS
+Exec=nixnav
+Icon=nixnav
+Terminal=false
+Type=Application
+Categories=Utility;FileTools;System;
+Keywords=file;search;navigate;fzf;
+StartupWMClass=nixnav
