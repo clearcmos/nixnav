@@ -20,6 +20,9 @@ nix run
 
 # Build the package
 nix build
+
+# Test toggle (with app running)
+./nixnav-toggle
 ```
 
 ## Architecture
@@ -27,12 +30,23 @@ nix build
 **Single-file application** (`main.py`) with these main classes:
 
 - **Config**: Manages bookmarks, exclude patterns, and settings in `~/.config/nixnav/config.json`
-- **FileScanner(QObject)**: Background thread for scanning files/folders with exclusion patterns
-- **GrepScanner(QObject)**: Background thread for searching file contents
-- **ResultItem(QFrame)**: Clickable result card showing file/folder with path and grep matches
-- **PreviewPanel(QFrame)**: Right-side panel showing file contents or directory listing
-- **NixNavOverlay(QWidget)**: Main fullscreen overlay with search, results, and preview
-- **NixNavApp**: Application controller managing system tray and overlay
+- **FileScanner(QObject)**: Background thread using `fd` for file/folder scanning
+- **GrepScanner(QObject)**: Background thread using `ripgrep` for content search
+- **NixNavWindow(QWidget)**: Main window with search, results list, and preview panel
+- **NixNavApp**: Application controller managing system tray, window, and IPC socket
+- **SocketListener(QThread)**: Unix socket server for receiving toggle commands
+
+### Why fd/ripgrep?
+
+Initial implementation used Python's `pathlib.rglob()` which was slow (~2-5s for large directories). Switched to subprocess calls to `fd` and `rg` (Rust binaries) for 50-100x speedup.
+
+### IPC Toggle Mechanism
+
+The app creates a Unix socket at `$XDG_RUNTIME_DIR/nixnav.sock` for instant window toggling:
+
+1. **Server side** (`main.py`): `SocketListener` thread accepts connections, emits Qt signal on "toggle" message
+2. **Client side** (`nixnav-toggle`): Minimal Python script sends "toggle" to socket, exits immediately
+3. **Why not QLocalSocket?** Direct Unix sockets avoid Qt overhead for sub-50ms response time
 
 ## Key Features
 
