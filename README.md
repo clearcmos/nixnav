@@ -75,13 +75,17 @@ Config stored at `~/.config/nixnav/config.json`:
 ```json
 {
   "bookmarks": [
-    {"name": "NixOS Config", "path": "/etc/nixos"},
-    {"name": "Home", "path": "/home/nicholas"}
+    {"name": "home", "path": "/home/nicholas"}
   ],
   "exclude_patterns": ["*.pyc", "__pycache__", ".git", "node_modules"],
   "max_results": 500
 }
 ```
+
+### Bookmark Management
+
+- **Add**: Click the `+` button next to the dropdown
+- **Rename/Delete**: Right-click on the bookmark dropdown
 
 ## Requirements
 

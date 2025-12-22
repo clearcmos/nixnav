@@ -37,8 +37,7 @@ class Config:
     def __init__(self):
         self.data = {
             "bookmarks": [
-                {"name": "NixOS Config", "path": "/etc/nixos"},
-                {"name": "Home", "path": str(Path.home())},
+                {"name": "home", "path": str(Path.home())},
             ],
             "last_bookmark": 0,
             "last_mode": "edit",
@@ -69,6 +68,19 @@ class Config:
     def add_bookmark(self, name: str, path: str):
         self.data["bookmarks"].append({"name": name, "path": path})
         self.save()
+
+    def rename_bookmark(self, index: int, new_name: str):
+        if 0 <= index < len(self.data["bookmarks"]):
+            self.data["bookmarks"][index]["name"] = new_name
+            self.save()
+
+    def delete_bookmark(self, index: int):
+        if 0 <= index < len(self.data["bookmarks"]):
+            del self.data["bookmarks"][index]
+            # Adjust last_bookmark if needed
+            if self.data.get("last_bookmark", 0) >= len(self.data["bookmarks"]):
+                self.data["last_bookmark"] = max(0, len(self.data["bookmarks"]) - 1)
+            self.save()
 
 
 class FileScanner(QObject):
@@ -238,7 +250,7 @@ class NixNavWindow(QWidget):
 
         top.addSpacing(8)
 
-        # Bookmark dropdown
+        # Bookmark dropdown with context menu for rename/delete
         self.bookmark_combo = QComboBox()
         self.bookmark_combo.setStyleSheet("""
             QComboBox { background: #252525; color: #ccc; border: 1px solid #444; padding: 4px 8px; border-radius: 3px; min-width: 140px; }
@@ -246,6 +258,8 @@ class NixNavWindow(QWidget):
             QComboBox QAbstractItemView { background: #252525; color: #ccc; selection-background-color: #5c9ae6; }
         """)
         self.bookmark_combo.currentIndexChanged.connect(self._on_bookmark_changed)
+        self.bookmark_combo.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.bookmark_combo.customContextMenuRequested.connect(self._show_bookmark_context_menu)
         top.addWidget(self.bookmark_combo)
 
         # Add bookmark button
@@ -397,6 +411,51 @@ class NixNavWindow(QWidget):
                     self.bookmark_combo.setCurrentIndex(self.bookmark_combo.count() - 1)
             else:
                 QMessageBox.warning(self, "Error", f"'{path}' is not a directory")
+
+    def _show_bookmark_context_menu(self, pos):
+        idx = self.bookmark_combo.currentIndex()
+        if idx < 0:
+            return
+
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu { background: #252525; color: #ccc; border: 1px solid #444; }
+            QMenu::item { padding: 6px 20px; }
+            QMenu::item:selected { background: #5c9ae6; }
+        """)
+
+        rename_action = QAction("Rename", self)
+        rename_action.triggered.connect(lambda: self._rename_bookmark(idx))
+        menu.addAction(rename_action)
+
+        delete_action = QAction("Delete", self)
+        delete_action.triggered.connect(lambda: self._delete_bookmark(idx))
+        menu.addAction(delete_action)
+
+        menu.exec(self.bookmark_combo.mapToGlobal(pos))
+
+    def _rename_bookmark(self, idx: int):
+        bookmarks = self.config.get_bookmarks()
+        if 0 <= idx < len(bookmarks):
+            current_name = bookmarks[idx]["name"]
+            new_name, ok = QInputDialog.getText(self, "Rename Bookmark", "New name:", text=current_name)
+            if ok and new_name and new_name != current_name:
+                self.config.rename_bookmark(idx, new_name)
+                self._load_bookmarks()
+
+    def _delete_bookmark(self, idx: int):
+        bookmarks = self.config.get_bookmarks()
+        if len(bookmarks) <= 1:
+            QMessageBox.warning(self, "Cannot Delete", "You must have at least one bookmark.")
+            return
+        if 0 <= idx < len(bookmarks):
+            name = bookmarks[idx]["name"]
+            reply = QMessageBox.question(self, "Delete Bookmark", f"Delete bookmark '{name}'?",
+                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                self.config.delete_bookmark(idx)
+                self._load_bookmarks()
+                self._refresh()
 
     def _get_path(self) -> str:
         idx = self.bookmark_combo.currentIndex()

@@ -84,8 +84,7 @@ The app creates a Unix socket at `$XDG_RUNTIME_DIR/nixnav.sock` for instant wind
 ```json
 {
   "bookmarks": [
-    {"name": "NixOS Config", "path": "/etc/nixos"},
-    {"name": "Home", "path": "/home/nicholas"}
+    {"name": "home", "path": "/home/nicholas"}
   ],
   "last_bookmark": 0,
   "last_mode": "edit",
@@ -94,6 +93,12 @@ The app creates a Unix socket at `$XDG_RUNTIME_DIR/nixnav.sock` for instant wind
   "window_geometry": "<base64 encoded Qt geometry>"
 }
 ```
+
+## Bookmark Management
+
+- **Add**: Click the + button next to the dropdown
+- **Rename/Delete**: Right-click on the bookmark dropdown for context menu
+- Default bookmark is just "home" (user's home directory)
 
 ## Binary File Filtering (Edit Mode)
 
