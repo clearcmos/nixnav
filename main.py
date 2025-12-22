@@ -9,8 +9,8 @@ Minimal, fzf-inspired interface.
 import sys
 import os
 import json
+import re
 import subprocess
-import fnmatch
 from pathlib import Path
 from typing import Optional, List
 
@@ -101,13 +101,14 @@ class FileScanner(QObject):
         "*.min.js", "*.min.css",  # Minified files aren't pleasant to edit
     ]
 
-    def __init__(self, root_path: str, mode: str, query: str, exclude_patterns: list, max_results: int):
+    def __init__(self, root_path: str, mode: str, query: str, exclude_patterns: list, max_results: int, ext_filter: str = None):
         super().__init__()
         self.root_path = root_path
         self.mode = mode
         self.query = query
         self.exclude_patterns = exclude_patterns
         self.max_results = max_results
+        self.ext_filter = ext_filter
         self._cancelled = False
         self._process = None
 
@@ -139,6 +140,10 @@ class FileScanner(QObject):
             if self.mode == "edit":
                 for pattern in self.BINARY_EXTENSIONS:
                     cmd.extend(["--exclude", pattern])
+
+            # Extension filter (e.g., "*.md" -> only .md files)
+            if self.ext_filter:
+                cmd.extend(["--extension", self.ext_filter])
 
             # Max results
             cmd.extend(["--max-results", str(self.max_results)])
@@ -350,6 +355,12 @@ class NixNavWindow(QWidget):
                 self.list.setCurrentRow(row - 1)
         elif event.key() in (Qt.Key_Return, Qt.Key_Enter):
             self._open_selected()
+        elif event.text() and event.text().isprintable():
+            # Forward printable keys to search field (type anywhere to search)
+            if not self.search.hasFocus():
+                self.search.setFocus()
+                self.search.setText(self.search.text() + event.text())
+                self.search.setCursorPosition(len(self.search.text()))
         else:
             super().keyPressEvent(event)
 
@@ -464,7 +475,50 @@ class NixNavWindow(QWidget):
     def _get_mode(self) -> str:
         return self.config.data.get("last_mode", "edit")
 
+    def _parse_query(self, text: str):
+        """Parse query for bookmark prefix and extension filter.
+
+        Examples:
+            "home: foo" -> bookmark="home", query="foo", ext=None
+            "data: *.md bar" -> bookmark="data", query="bar", ext="md"
+            "*.py test" -> bookmark=None, query="test", ext="py"
+            "simple query" -> bookmark=None, query="simple query", ext=None
+        """
+        text = text.strip()
+        bookmark_name = None
+        ext_filter = None
+        query = text
+
+        # Check for bookmark prefix (e.g., "home: query")
+        if ": " in text:
+            prefix, rest = text.split(": ", 1)
+            # Check if prefix matches a bookmark name (case-insensitive)
+            for i, bm in enumerate(self.config.get_bookmarks()):
+                if bm["name"].lower() == prefix.lower():
+                    bookmark_name = prefix
+                    query = rest.strip()
+                    break
+
+        # Check for extension filter (e.g., "*.md" or "*.py")
+        ext_match = re.search(r'\*\.(\w+)', query)
+        if ext_match:
+            ext_filter = ext_match.group(1)
+            query = re.sub(r'\*\.\w+\s*', '', query).strip()
+
+        return bookmark_name, query, ext_filter
+
     def _on_search_changed(self, text: str):
+        # Check for bookmark prefix and switch if found
+        bookmark_name, _, _ = self._parse_query(text)
+        if bookmark_name:
+            for i in range(self.bookmark_combo.count()):
+                if self.bookmark_combo.itemText(i).lower() == bookmark_name.lower():
+                    if self.bookmark_combo.currentIndex() != i:
+                        self.bookmark_combo.blockSignals(True)
+                        self.bookmark_combo.setCurrentIndex(i)
+                        self.bookmark_combo.blockSignals(False)
+                    break
+
         if hasattr(self, '_timer'):
             self._timer.stop()
         else:
@@ -490,18 +544,20 @@ class NixNavWindow(QWidget):
         self._cancel_scan()
         # Don't clear list/preview here - wait until results arrive to avoid flash
 
-        query = self.search.text().strip()
+        raw_query = self.search.text().strip()
+        _, query, ext_filter = self._parse_query(raw_query)
         root = self._get_path()
         mode = self._get_mode()
 
         self.status.setText("...")
-        self._start_scan(root, mode, query)
+        self._start_scan(root, mode, query, ext_filter)
 
-    def _start_scan(self, root: str, mode: str, query: str):
+    def _start_scan(self, root: str, mode: str, query: str, ext_filter: str = None):
         self._scanner_thread = QThread()
         self._scanner = FileScanner(root, mode, query,
                                     self.config.data.get("exclude_patterns", []),
-                                    self.config.data.get("max_results", 500))
+                                    self.config.data.get("max_results", 500),
+                                    ext_filter)
         self._scanner.moveToThread(self._scanner_thread)
         self._scanner_thread.started.connect(self._scanner.run)
         self._scanner.results_ready.connect(self._on_file_results)
