@@ -10,9 +10,12 @@ import sys
 import os
 import json
 import re
+import socket
 import subprocess
+import zipfile
+import tarfile
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -27,10 +30,703 @@ from PySide6.QtGui import QIcon, QAction, QFont, QKeySequence, QShortcut
 # Config paths
 CONFIG_DIR = Path.home() / ".config" / "nixnav"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+DAEMON_SOCKET = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}") + "/nixnav-daemon.sock"
 
 
 def ensure_dirs():
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def find_daemon_binary() -> Optional[str]:
+    """Find the nixnav-daemon binary."""
+    # Check common locations
+    candidates = [
+        Path(__file__).parent / "daemon" / "target" / "release" / "nixnav-daemon",
+        Path.home() / ".nix-profile" / "bin" / "nixnav-daemon",
+        Path("/run/current-system/sw/bin/nixnav-daemon"),
+    ]
+    # Also check PATH
+    for p in os.environ.get("PATH", "").split(":"):
+        candidates.append(Path(p) / "nixnav-daemon")
+
+    for path in candidates:
+        if path.exists() and os.access(path, os.X_OK):
+            return str(path)
+    return None
+
+
+def start_daemon() -> bool:
+    """Start the daemon if not running. Returns True if daemon is available."""
+    # Check if already running
+    if os.path.exists(DAEMON_SOCKET):
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(1)
+            sock.connect(DAEMON_SOCKET)
+            sock.sendall(b"PING\n")
+            response = sock.recv(1024)
+            sock.close()
+            if b"pong" in response:
+                return True
+        except:
+            pass
+        # Stale socket
+        try:
+            os.unlink(DAEMON_SOCKET)
+        except:
+            pass
+
+    # Find and start daemon
+    daemon_bin = find_daemon_binary()
+    if not daemon_bin:
+        return False
+
+    try:
+        # Start daemon in background
+        subprocess.Popen(
+            [daemon_bin],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+        # Wait for socket to appear
+        for _ in range(50):  # 5 seconds max
+            if os.path.exists(DAEMON_SOCKET):
+                return True
+            import time
+            time.sleep(0.1)
+    except:
+        pass
+    return False
+
+
+class DaemonClient:
+    """Client for communicating with nixnav-daemon."""
+
+    def __init__(self):
+        self._socket: Optional[socket.socket] = None
+        self._daemon_started = False
+
+    def connect(self) -> bool:
+        """Connect to the daemon, starting it if necessary."""
+        if self._socket:
+            return True
+
+        # Try to start daemon if not already attempted
+        if not self._daemon_started:
+            self._daemon_started = True
+            start_daemon()
+
+        try:
+            self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self._socket.settimeout(5.0)
+            self._socket.connect(DAEMON_SOCKET)
+            return True
+        except (socket.error, FileNotFoundError):
+            self._socket = None
+            return False
+
+    def disconnect(self):
+        """Disconnect from the daemon."""
+        if self._socket:
+            try:
+                self._socket.close()
+            except:
+                pass
+            self._socket = None
+
+    def is_connected(self) -> bool:
+        """Check if connected to daemon."""
+        return self._socket is not None
+
+    def ping(self) -> bool:
+        """Check if daemon is responsive."""
+        if not self.connect():
+            return False
+        try:
+            self._socket.sendall(b"PING\n")
+            response = self._socket.recv(4096).decode().strip()
+            return "pong" in response
+        except:
+            self.disconnect()
+            return False
+
+    def search(self, bookmark_path: str, query: str, extension: Optional[str] = None) -> Tuple[List[dict], int, int]:
+        """
+        Search for files via the daemon.
+
+        Returns: (results, total_indexed, search_time_ms)
+        """
+        if not self.connect():
+            return [], 0, 0
+
+        try:
+            request = {
+                "bookmark_path": bookmark_path,
+                "mode": "all",  # Search all files and directories
+                "query": query,
+                "extension": extension,
+            }
+            cmd = f"SEARCH {json.dumps(request)}\n"
+            self._socket.sendall(cmd.encode())
+
+            # Read response
+            response = b""
+            while True:
+                chunk = self._socket.recv(65536)
+                if not chunk:
+                    break
+                response += chunk
+                if b"\n" in response:
+                    break
+
+            data = json.loads(response.decode().strip())
+            if "error" in data:
+                return [], 0, 0
+
+            results = data.get("results", [])
+            total = data.get("total_indexed", 0)
+            time_ms = data.get("search_time_ms", 0)
+
+            return results, total, time_ms
+
+        except Exception as e:
+            self.disconnect()
+            return [], 0, 0
+
+    def add_bookmark(self, name: str, path: str) -> bool:
+        """Add a bookmark to the daemon's index. Non-blocking - returns immediately."""
+        if not self.connect():
+            return False
+
+        try:
+            # Detect if network mount
+            is_network = self._is_network_mount(path)
+            bookmark = {"name": name, "path": path, "is_network": is_network}
+            cmd = f"ADD_BOOKMARK {json.dumps(bookmark)}\n"
+
+            # Use a longer timeout for scanning
+            old_timeout = self._socket.gettimeout()
+            self._socket.settimeout(300)  # 5 minutes for large directories
+
+            self._socket.sendall(cmd.encode())
+
+            response = b""
+            while b"\n" not in response:
+                chunk = self._socket.recv(65536)
+                if not chunk:
+                    break
+                response += chunk
+
+            self._socket.settimeout(old_timeout)
+            data = json.loads(response.decode().strip())
+            return data.get("status") == "ok"
+        except Exception:
+            self.disconnect()
+            return False
+
+    def rescan(self, path: str) -> int:
+        """Trigger a rescan of a path. Returns number of files indexed."""
+        if not self.connect():
+            return 0
+
+        try:
+            cmd = f"RESCAN {path}\n"
+            self._socket.sendall(cmd.encode())
+
+            response = self._socket.recv(4096).decode().strip()
+            data = json.loads(response)
+            return data.get("indexed", 0)
+        except:
+            self.disconnect()
+            return 0
+
+    def get_stats(self) -> dict:
+        """Get daemon statistics."""
+        if not self.connect():
+            return {"connected": False, "files": 0, "trigrams": 0, "bookmarks": 0}
+
+        try:
+            self._socket.sendall(b"STATS\n")
+            response = b""
+            while b"\n" not in response:
+                chunk = self._socket.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+            data = json.loads(response.decode().strip())
+            data["connected"] = True
+            return data
+        except:
+            self.disconnect()
+            return {"connected": False, "files": 0, "trigrams": 0, "bookmarks": 0}
+
+    def _is_network_mount(self, path: str) -> bool:
+        """Check if a path is on a network mount."""
+        try:
+            with open("/proc/mounts") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        mount_point, fs_type = parts[1], parts[2]
+                        if path.startswith(mount_point):
+                            return fs_type in ("nfs", "nfs4", "cifs", "smb", "smbfs", "fuse.sshfs")
+        except:
+            pass
+        return False
+
+
+# Global daemon client instance
+_daemon_client = DaemonClient()
+
+
+# ============================================================================
+# File Type Detection and Smart Previews
+# ============================================================================
+
+# Binary file extensions (no text preview)
+BINARY_EXTENSIONS = {
+    # Images
+    "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "svg", "tiff", "tif", "raw", "psd", "xcf",
+    # Compiled/executables
+    "exe", "dll", "so", "dylib", "a", "o", "obj", "bin", "dat",
+    # Fonts
+    "ttf", "otf", "woff", "woff2", "eot",
+    # Java/Python bytecode
+    "class", "jar", "war", "pyc", "pyo", "whl",
+    # Database
+    "db", "sqlite", "sqlite3",
+    # Documents (handled separately)
+    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp",
+}
+
+# Audio extensions (show ID3/codec info)
+AUDIO_EXTENSIONS = {"mp3", "flac", "ogg", "m4a", "aac", "wav", "wma", "opus", "aiff"}
+
+# Video extensions (show media info)
+VIDEO_EXTENSIONS = {"mp4", "mkv", "avi", "mov", "wmv", "webm", "m4v", "flv", "ts", "mts"}
+
+# Archive extensions (show contents)
+ARCHIVE_EXTENSIONS = {"zip", "tar", "gz", "bz2", "xz", "7z", "rar", "zst", "tgz", "tbz2", "txz"}
+
+
+def get_file_category(path: str) -> str:
+    """Determine the category of a file based on extension."""
+    ext = Path(path).suffix.lower().lstrip(".")
+
+    # Handle compound extensions like .tar.gz
+    name = Path(path).name.lower()
+    if name.endswith(".tar.gz") or name.endswith(".tgz"):
+        return "archive"
+    if name.endswith(".tar.bz2") or name.endswith(".tbz2"):
+        return "archive"
+    if name.endswith(".tar.xz") or name.endswith(".txz"):
+        return "archive"
+
+    if ext in AUDIO_EXTENSIONS:
+        return "audio"
+    if ext in VIDEO_EXTENSIONS:
+        return "video"
+    if ext in ARCHIVE_EXTENSIONS:
+        return "archive"
+    if ext in BINARY_EXTENSIONS:
+        return "binary"
+    return "text"
+
+
+def preview_binary(path: str) -> str:
+    """Generate preview for binary files."""
+    try:
+        p = Path(path)
+        stat = p.stat()
+        size = stat.st_size
+        ext = p.suffix.lower().lstrip(".")
+
+        # Format size
+        if size < 1024:
+            size_str = f"{size} bytes"
+        elif size < 1024 * 1024:
+            size_str = f"{size / 1024:.1f} KB"
+        elif size < 1024 * 1024 * 1024:
+            size_str = f"{size / (1024 * 1024):.1f} MB"
+        else:
+            size_str = f"{size / (1024 * 1024 * 1024):.2f} GB"
+
+        lines = [
+            "━━━ Binary File ━━━",
+            "",
+            f"  Name: {p.name}",
+            f"  Size: {size_str}",
+            f"  Type: {ext.upper() if ext else 'Unknown'}",
+            "",
+            "  (No text preview available for binary files)",
+        ]
+
+        # Add type-specific info
+        if ext in {"png", "jpg", "jpeg", "gif", "bmp", "webp", "tiff", "tif"}:
+            lines[0] = "━━━ Image File ━━━"
+            # Try to get image dimensions using file command
+            try:
+                result = subprocess.run(
+                    ["file", path], capture_output=True, text=True, timeout=2
+                )
+                if result.returncode == 0:
+                    info = result.stdout.strip()
+                    # Extract dimensions if present
+                    import re
+                    dims = re.search(r'(\d+)\s*x\s*(\d+)', info)
+                    if dims:
+                        lines.insert(4, f"  Dimensions: {dims.group(1)} × {dims.group(2)}")
+            except:
+                pass
+        elif ext in {"pdf"}:
+            lines[0] = "━━━ PDF Document ━━━"
+        elif ext in {"doc", "docx", "odt"}:
+            lines[0] = "━━━ Word Document ━━━"
+        elif ext in {"xls", "xlsx", "ods"}:
+            lines[0] = "━━━ Spreadsheet ━━━"
+        elif ext in {"ppt", "pptx", "odp"}:
+            lines[0] = "━━━ Presentation ━━━"
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error reading file info: {e}"
+
+
+def preview_audio(path: str) -> str:
+    """Generate preview for audio files with ID3 tags and codec info."""
+    try:
+        p = Path(path)
+        stat = p.stat()
+        size = stat.st_size
+        ext = p.suffix.lower().lstrip(".")
+
+        # Format size
+        if size < 1024 * 1024:
+            size_str = f"{size / 1024:.1f} KB"
+        else:
+            size_str = f"{size / (1024 * 1024):.1f} MB"
+
+        lines = [
+            "━━━ Audio File ━━━",
+            "",
+            f"  File: {p.name}",
+            f"  Size: {size_str}",
+            "",
+        ]
+
+        # Try to get audio info using ffprobe
+        try:
+            result = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", path],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                import json as json_mod
+                data = json_mod.loads(result.stdout)
+
+                # Format info
+                fmt = data.get("format", {})
+                if fmt:
+                    duration = float(fmt.get("duration", 0))
+                    if duration > 0:
+                        mins = int(duration // 60)
+                        secs = int(duration % 60)
+                        lines.append(f"  Duration: {mins}:{secs:02d}")
+
+                    bitrate = int(fmt.get("bit_rate", 0))
+                    if bitrate > 0:
+                        lines.append(f"  Bitrate: {bitrate // 1000} kbps")
+
+                # Audio stream info
+                for stream in data.get("streams", []):
+                    if stream.get("codec_type") == "audio":
+                        codec = stream.get("codec_name", "unknown")
+                        sample_rate = stream.get("sample_rate", "")
+                        channels = stream.get("channels", 0)
+                        ch_str = "Stereo" if channels == 2 else "Mono" if channels == 1 else f"{channels}ch"
+                        lines.append(f"  Codec: {codec.upper()}")
+                        if sample_rate:
+                            lines.append(f"  Sample Rate: {int(sample_rate) // 1000} kHz")
+                        lines.append(f"  Channels: {ch_str}")
+                        break
+
+                # Tags (ID3 or other metadata)
+                tags = fmt.get("tags", {})
+                if tags:
+                    lines.append("")
+                    lines.append("  ─── Tags ───")
+                    tag_order = ["title", "artist", "album", "track", "genre", "date", "year"]
+                    for tag in tag_order:
+                        for key, val in tags.items():
+                            if key.lower() == tag and val:
+                                lines.append(f"  {key.title()}: {val}")
+                                break
+        except FileNotFoundError:
+            lines.append("  (Install ffmpeg for detailed audio info)")
+        except Exception:
+            pass
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error reading audio file: {e}"
+
+
+def preview_video(path: str) -> str:
+    """Generate preview for video files with media info."""
+    try:
+        p = Path(path)
+        stat = p.stat()
+        size = stat.st_size
+
+        # Format size
+        if size < 1024 * 1024:
+            size_str = f"{size / 1024:.1f} KB"
+        elif size < 1024 * 1024 * 1024:
+            size_str = f"{size / (1024 * 1024):.1f} MB"
+        else:
+            size_str = f"{size / (1024 * 1024 * 1024):.2f} GB"
+
+        lines = [
+            "━━━ Video File ━━━",
+            "",
+            f"  File: {p.name}",
+            f"  Size: {size_str}",
+            "",
+        ]
+
+        # Try to get video info using ffprobe
+        try:
+            result = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", path],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                import json as json_mod
+                data = json_mod.loads(result.stdout)
+
+                # Format info
+                fmt = data.get("format", {})
+                if fmt:
+                    duration = float(fmt.get("duration", 0))
+                    if duration > 0:
+                        hours = int(duration // 3600)
+                        mins = int((duration % 3600) // 60)
+                        secs = int(duration % 60)
+                        if hours > 0:
+                            lines.append(f"  Duration: {hours}:{mins:02d}:{secs:02d}")
+                        else:
+                            lines.append(f"  Duration: {mins}:{secs:02d}")
+
+                    bitrate = int(fmt.get("bit_rate", 0))
+                    if bitrate > 0:
+                        lines.append(f"  Bitrate: {bitrate // 1000} kbps")
+
+                # Video stream
+                lines.append("")
+                lines.append("  ─── Video ───")
+                for stream in data.get("streams", []):
+                    if stream.get("codec_type") == "video":
+                        codec = stream.get("codec_name", "unknown")
+                        width = stream.get("width", 0)
+                        height = stream.get("height", 0)
+                        fps_str = stream.get("r_frame_rate", "0/1")
+                        try:
+                            num, den = map(int, fps_str.split("/"))
+                            fps = num / den if den else 0
+                        except:
+                            fps = 0
+
+                        lines.append(f"  Codec: {codec.upper()}")
+                        if width and height:
+                            lines.append(f"  Resolution: {width}×{height}")
+                        if fps > 0:
+                            lines.append(f"  Frame Rate: {fps:.2f} fps")
+                        break
+
+                # Audio streams
+                audio_streams = [s for s in data.get("streams", []) if s.get("codec_type") == "audio"]
+                if audio_streams:
+                    lines.append("")
+                    lines.append("  ─── Audio ───")
+                    for i, stream in enumerate(audio_streams):
+                        codec = stream.get("codec_name", "unknown")
+                        channels = stream.get("channels", 0)
+                        lang = stream.get("tags", {}).get("language", "")
+                        ch_str = "Stereo" if channels == 2 else "Mono" if channels == 1 else f"{channels}ch"
+                        track = f"  Track {i+1}: {codec.upper()} ({ch_str})"
+                        if lang:
+                            track += f" [{lang}]"
+                        lines.append(track)
+
+                # Subtitle streams
+                sub_streams = [s for s in data.get("streams", []) if s.get("codec_type") == "subtitle"]
+                if sub_streams:
+                    lines.append("")
+                    lines.append("  ─── Subtitles ───")
+                    for stream in sub_streams:
+                        codec = stream.get("codec_name", "")
+                        lang = stream.get("tags", {}).get("language", "unknown")
+                        title = stream.get("tags", {}).get("title", "")
+                        sub = f"  {lang.upper()}"
+                        if title:
+                            sub += f": {title}"
+                        if codec:
+                            sub += f" ({codec})"
+                        lines.append(sub)
+
+        except FileNotFoundError:
+            lines.append("  (Install ffmpeg for detailed video info)")
+        except Exception:
+            pass
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error reading video file: {e}"
+
+
+def preview_archive(path: str) -> str:
+    """Generate preview for archive files with contents listing."""
+    try:
+        p = Path(path)
+        stat = p.stat()
+        size = stat.st_size
+        ext = p.suffix.lower().lstrip(".")
+        name = p.name.lower()
+
+        # Format size
+        if size < 1024 * 1024:
+            size_str = f"{size / 1024:.1f} KB"
+        elif size < 1024 * 1024 * 1024:
+            size_str = f"{size / (1024 * 1024):.1f} MB"
+        else:
+            size_str = f"{size / (1024 * 1024 * 1024):.2f} GB"
+
+        lines = [
+            "━━━ Archive File ━━━",
+            "",
+            f"  File: {p.name}",
+            f"  Size: {size_str}",
+            "",
+            "  ─── Contents ───",
+        ]
+
+        contents = []
+        max_entries = 50
+        total_files = 0
+
+        # Handle different archive types
+        if ext == "zip" or name.endswith(".zip"):
+            try:
+                with zipfile.ZipFile(path, 'r') as zf:
+                    for info in zf.infolist():
+                        total_files += 1
+                        if len(contents) < max_entries:
+                            size_kb = info.file_size / 1024
+                            if size_kb >= 1024:
+                                sz = f"{size_kb / 1024:.1f}M"
+                            elif size_kb >= 1:
+                                sz = f"{size_kb:.0f}K"
+                            else:
+                                sz = f"{info.file_size}B"
+                            is_dir = info.filename.endswith("/")
+                            prefix = "📁 " if is_dir else "   "
+                            contents.append(f"  {prefix}{info.filename}" + (f" ({sz})" if not is_dir else ""))
+            except zipfile.BadZipFile:
+                lines.append("  (Invalid or corrupted ZIP file)")
+                return "\n".join(lines)
+
+        elif name.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".tar")):
+            try:
+                mode = "r:*"  # Auto-detect compression
+                with tarfile.open(path, mode) as tf:
+                    for member in tf:
+                        total_files += 1
+                        if len(contents) < max_entries:
+                            size_kb = member.size / 1024
+                            if size_kb >= 1024:
+                                sz = f"{size_kb / 1024:.1f}M"
+                            elif size_kb >= 1:
+                                sz = f"{size_kb:.0f}K"
+                            else:
+                                sz = f"{member.size}B"
+                            is_dir = member.isdir()
+                            prefix = "📁 " if is_dir else "   "
+                            contents.append(f"  {prefix}{member.name}" + (f" ({sz})" if not is_dir else ""))
+            except Exception as e:
+                lines.append(f"  (Error reading tar archive: {e})")
+                return "\n".join(lines)
+
+        elif ext in {"gz", "bz2", "xz", "zst"}:
+            # Single-file compression
+            lines[0] = "━━━ Compressed File ━━━"
+            lines.append(f"  Compression: {ext.upper()}")
+            # Get uncompressed name
+            uncomp_name = p.stem
+            lines.append(f"  Contains: {uncomp_name}")
+            return "\n".join(lines)
+
+        elif ext == "7z":
+            # Try 7z command
+            try:
+                result = subprocess.run(
+                    ["7z", "l", path], capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0:
+                    in_list = False
+                    for line in result.stdout.split("\n"):
+                        if "---" in line:
+                            in_list = not in_list
+                            continue
+                        if in_list and line.strip():
+                            total_files += 1
+                            if len(contents) < max_entries:
+                                # 7z list format varies, just show filenames
+                                parts = line.split()
+                                if len(parts) >= 6:
+                                    fname = " ".join(parts[5:])
+                                    contents.append(f"     {fname}")
+            except FileNotFoundError:
+                lines.append("  (Install p7zip for 7z support)")
+                return "\n".join(lines)
+            except Exception:
+                pass
+
+        elif ext == "rar":
+            # Try unrar command
+            try:
+                result = subprocess.run(
+                    ["unrar", "l", path], capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0:
+                    in_list = False
+                    for line in result.stdout.split("\n"):
+                        if "---" in line:
+                            in_list = not in_list
+                            continue
+                        if in_list and line.strip():
+                            total_files += 1
+                            if len(contents) < max_entries:
+                                contents.append(f"     {line.strip()}")
+            except FileNotFoundError:
+                lines.append("  (Install unrar for RAR support)")
+                return "\n".join(lines)
+            except Exception:
+                pass
+
+        # Add contents to lines
+        if contents:
+            lines.extend(contents)
+            if total_files > max_entries:
+                lines.append(f"  ... and {total_files - max_entries} more entries")
+            lines.append("")
+            lines.append(f"  Total: {total_files} entries")
+        elif total_files == 0:
+            lines.append("  (Empty archive)")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error reading archive: {e}"
 
 
 class Config:
@@ -41,7 +737,7 @@ class Config:
             ],
             "last_bookmark": 0,
             "last_mode": "edit",
-            "exclude_patterns": ["*.pyc", "__pycache__", ".git", "node_modules", "*.log"],
+            "exclude_patterns": ["*.pyc", "__pycache__", ".git", "node_modules", "*.log", ".Trash*", "Trash"],
             "max_results": 500,
         }
         self.load()
@@ -84,27 +780,18 @@ class Config:
 
 
 class FileScanner(QObject):
-    """Fast file scanner using fd (Rust-based find)."""
+    """
+    Fast file scanner using nixnav-daemon (trigram index) with fallback to fd.
+
+    The daemon provides instant search across millions of files.
+    Falls back to fd if daemon is not running.
+    """
     results_ready = Signal(list)
     finished = Signal()
 
-    # Binary/non-editable file extensions to exclude in edit mode
-    BINARY_EXTENSIONS = [
-        "*.png", "*.jpg", "*.jpeg", "*.gif", "*.bmp", "*.ico", "*.webp", "*.svg",
-        "*.mp3", "*.mp4", "*.wav", "*.avi", "*.mkv", "*.mov", "*.flac", "*.ogg",
-        "*.pdf", "*.doc", "*.docx", "*.xls", "*.xlsx", "*.ppt", "*.pptx",
-        "*.zip", "*.tar", "*.gz", "*.bz2", "*.xz", "*.7z", "*.rar",
-        "*.exe", "*.dll", "*.so", "*.dylib", "*.a", "*.o", "*.obj",
-        "*.bin", "*.dat", "*.db", "*.sqlite", "*.sqlite3",
-        "*.ttf", "*.otf", "*.woff", "*.woff2", "*.eot",
-        "*.class", "*.jar", "*.war", "*.pyc", "*.pyo", "*.whl",
-        "*.min.js", "*.min.css",  # Minified files aren't pleasant to edit
-    ]
-
-    def __init__(self, root_path: str, mode: str, query: str, exclude_patterns: list, max_results: int, ext_filter: str = None):
+    def __init__(self, root_path: str, query: str, exclude_patterns: list, max_results: int, ext_filter: str = None):
         super().__init__()
         self.root_path = root_path
-        self.mode = mode
         self.query = query
         self.exclude_patterns = exclude_patterns
         self.max_results = max_results
@@ -121,67 +808,89 @@ class FileScanner(QObject):
                 pass
 
     def run(self):
+        # Try daemon first (instant search)
+        if self._try_daemon_search():
+            return
+
+        # Fallback to fd
+        self._fd_search()
+
+    def _try_daemon_search(self) -> bool:
+        """Try searching via daemon. Returns True if successful."""
+        global _daemon_client
+
+        try:
+            results, total, time_ms = _daemon_client.search(
+                bookmark_path=self.root_path,
+                query=self.query,
+                extension=self.ext_filter,
+            )
+
+            if self._cancelled:
+                return True
+
+            if results or _daemon_client.is_connected():
+                self._daemon_search_time = time_ms
+                self._daemon_total_indexed = total
+                converted = [
+                    (r["path"], r.get("is_dir", False), r.get("mtime", 0))
+                    for r in results
+                ]
+                self.results_ready.emit(converted)
+                self.finished.emit()
+                return True
+
+        except Exception:
+            pass
+
+        return False
+
+    def _fd_search(self):
+        """Fallback search using fd command."""
         results = []
         try:
-            # Build fd command
             cmd = ["fd", "--color=never", "--absolute-path"]
 
-            # Type filter
-            if self.mode == "gotodir":
-                cmd.extend(["--type", "d"])
-            else:  # edit or gotofile - search files
-                cmd.extend(["--type", "f"])
-
-            # Exclude patterns
+            # Search both files and directories
             for pattern in self.exclude_patterns:
                 cmd.extend(["--exclude", pattern])
 
-            # For edit mode, also exclude binary files
-            if self.mode == "edit":
-                for pattern in self.BINARY_EXTENSIONS:
-                    cmd.extend(["--exclude", pattern])
-
-            # Extension filter (e.g., "*.md" -> only .md files)
             if self.ext_filter:
                 cmd.extend(["--extension", self.ext_filter])
 
-            # Max results
             cmd.extend(["--max-results", str(self.max_results)])
 
-            # Query pattern (empty = match all)
             if self.query:
                 cmd.append(self.query)
             else:
-                cmd.append(".")  # Match everything
+                cmd.append(".")
 
-            # Search path
             cmd.append(self.root_path)
 
-            # Run fd
             self._process = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
             )
-            stdout, _ = self._process.communicate(timeout=10)
+            stdout, _ = self._process.communicate(timeout=30)
 
             if self._cancelled:
                 return
 
-            # Parse results
-            is_dir = (self.mode == "gotodir")
             for line in stdout.strip().split('\n'):
                 if not line:
                     continue
                 path = line.strip()
                 try:
-                    mtime = Path(path).stat().st_mtime
+                    p = Path(path)
+                    is_dir = p.is_dir()
+                    mtime = p.stat().st_mtime
                     results.append((path, is_dir, mtime))
                 except:
-                    results.append((path, is_dir, 0))
+                    results.append((path, False, 0))
 
         except subprocess.TimeoutExpired:
             if self._process:
                 self._process.kill()
-        except Exception as e:
+        except Exception:
             pass
 
         if not self._cancelled:
@@ -227,33 +936,9 @@ class NixNavWindow(QWidget):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
-        # Top bar: mode + bookmark
+        # Top bar: bookmark selector
         top = QHBoxLayout()
         top.setSpacing(8)
-
-        # Mode buttons
-        self.mode_buttons = []
-        modes = [
-            ("Edit", "edit", "Edit file in Kate"),
-            ("File", "gotofile", "Go to file's folder in Dolphin"),
-            ("Dir", "gotodir", "Go to folder in Dolphin"),
-        ]
-        for label, mode, tooltip in modes:
-            btn = QPushButton(label)
-            btn.setCheckable(True)
-            btn.setProperty("mode", mode)
-            btn.setMinimumWidth(50)
-            btn.setToolTip(tooltip)
-            btn.clicked.connect(lambda _, m=mode: self.set_mode(m))
-            btn.setStyleSheet("""
-                QPushButton { background: #333; color: #888; border: none; padding: 4px 8px; border-radius: 3px; font-weight: bold; }
-                QPushButton:checked { background: #5c9ae6; color: #fff; }
-                QPushButton:hover:!checked { background: #444; }
-            """)
-            self.mode_buttons.append(btn)
-            top.addWidget(btn)
-
-        top.addSpacing(8)
 
         # Bookmark dropdown with context menu for rename/delete
         self.bookmark_combo = QComboBox()
@@ -321,7 +1006,7 @@ class NixNavWindow(QWidget):
         layout.addWidget(self.splitter, 1)
 
         # Help line
-        help_lbl = QLabel("Enter: Open | Tab: Mode | Esc: Close")
+        help_lbl = QLabel("Enter: Open | Ctrl+O: Open folder | Ctrl+R: Refresh index | Esc: Close")
         help_lbl.setStyleSheet("color: #444; font-size: 10px;")
         help_lbl.setAlignment(Qt.AlignCenter)
         layout.addWidget(help_lbl)
@@ -330,15 +1015,49 @@ class NixNavWindow(QWidget):
         self.setStyleSheet("NixNavWindow { background: #141414; }")
 
     def setup_shortcuts(self):
-        QShortcut(QKeySequence(Qt.Key_Tab), self).activated.connect(self._cycle_mode)
         QShortcut(QKeySequence("Ctrl+O"), self).activated.connect(self._open_folder)
+        QShortcut(QKeySequence("Ctrl+R"), self).activated.connect(self._rescan_bookmark)
 
     def showEvent(self, event):
         super().showEvent(event)
         self._load_bookmarks()
-        self._set_mode_from_config()
         self.search.setFocus()
+        # Sync bookmarks to daemon (in background)
+        self._sync_bookmarks_to_daemon()
         self._refresh()
+
+    def _sync_bookmarks_to_daemon(self):
+        """Ensure all bookmarks are indexed by the daemon (runs in background thread)."""
+        import threading
+
+        bookmarks = self.config.get_bookmarks().copy()
+
+        def sync():
+            # Use separate connection for background sync
+            try:
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                sock.settimeout(300)
+                sock.connect(DAEMON_SOCKET)
+
+                for bm in bookmarks:
+                    is_network = bm["path"].startswith("/mnt/")
+                    bookmark = {"name": bm["name"], "path": bm["path"], "is_network": is_network}
+                    cmd = f"ADD_BOOKMARK {json.dumps(bookmark)}\n"
+                    sock.sendall(cmd.encode())
+                    # Wait for response
+                    response = b""
+                    while b"\n" not in response:
+                        chunk = sock.recv(65536)
+                        if not chunk:
+                            break
+                        response += chunk
+
+                sock.close()
+            except Exception:
+                pass
+
+        thread = threading.Thread(target=sync, daemon=True)
+        thread.start()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
@@ -374,37 +1093,6 @@ class NixNavWindow(QWidget):
             self.bookmark_combo.setCurrentIndex(idx)
         self.bookmark_combo.blockSignals(False)
 
-    def _set_mode_from_config(self):
-        mode = self.config.data.get("last_mode", "edit")
-        # Handle old config values
-        if mode in ("files", "grep"):
-            mode = "edit"
-        elif mode == "folders":
-            mode = "gotodir"
-        self.set_mode(mode)
-
-    def set_mode(self, mode: str):
-        for btn in self.mode_buttons:
-            btn.setChecked(btn.property("mode") == mode)
-        self.config.data["last_mode"] = mode
-        self.config.save()
-        placeholders = {
-            "edit": "> Search files to edit...",
-            "gotofile": "> Search files...",
-            "gotodir": "> Search folders...",
-        }
-        self.search.setPlaceholderText(placeholders.get(mode, "> Search..."))
-        self._refresh()
-
-    def _cycle_mode(self):
-        modes = ["edit", "gotofile", "gotodir"]
-        current = self.config.data.get("last_mode", "edit")
-        try:
-            idx = modes.index(current)
-            self.set_mode(modes[(idx + 1) % len(modes)])
-        except:
-            self.set_mode("edit")
-
     def _on_bookmark_changed(self, idx):
         self.config.data["last_bookmark"] = idx
         self.config.save()
@@ -420,6 +1108,8 @@ class NixNavWindow(QWidget):
                     self.config.add_bookmark(name, str(p))
                     self._load_bookmarks()
                     self.bookmark_combo.setCurrentIndex(self.bookmark_combo.count() - 1)
+                    # Tell daemon to index this path
+                    _daemon_client.add_bookmark(name, str(p))
             else:
                 QMessageBox.warning(self, "Error", f"'{path}' is not a directory")
 
@@ -471,9 +1161,6 @@ class NixNavWindow(QWidget):
     def _get_path(self) -> str:
         idx = self.bookmark_combo.currentIndex()
         return self.bookmark_combo.itemData(idx) if idx >= 0 else str(Path.home())
-
-    def _get_mode(self) -> str:
-        return self.config.data.get("last_mode", "edit")
 
     def _parse_query(self, text: str):
         """Parse query for bookmark prefix and extension filter.
@@ -547,14 +1234,13 @@ class NixNavWindow(QWidget):
         raw_query = self.search.text().strip()
         _, query, ext_filter = self._parse_query(raw_query)
         root = self._get_path()
-        mode = self._get_mode()
 
         self.status.setText("...")
-        self._start_scan(root, mode, query, ext_filter)
+        self._start_scan(root, query, ext_filter)
 
-    def _start_scan(self, root: str, mode: str, query: str, ext_filter: str = None):
+    def _start_scan(self, root: str, query: str, ext_filter: str = None):
         self._scanner_thread = QThread()
-        self._scanner = FileScanner(root, mode, query,
+        self._scanner = FileScanner(root, query,
                                     self.config.data.get("exclude_patterns", []),
                                     self.config.data.get("max_results", 500),
                                     ext_filter)
@@ -584,7 +1270,16 @@ class NixNavWindow(QWidget):
             self._results_data.append((path, is_dir, None))
 
         self.list.setUpdatesEnabled(True)
-        self.status.setText(str(len(results)))
+
+        # Show result count and search time if available
+        status_text = str(len(results))
+        if self._scanner and hasattr(self._scanner, '_daemon_search_time'):
+            time_ms = self._scanner._daemon_search_time
+            total = getattr(self._scanner, '_daemon_total_indexed', 0)
+            if total > 0:
+                status_text = f"{len(results)} ({time_ms}ms, {total:,} indexed)"
+        self.status.setText(status_text)
+
         if self.list.count() > 0:
             self.list.setCurrentRow(0)
 
@@ -598,19 +1293,32 @@ class NixNavWindow(QWidget):
         if is_dir:
             try:
                 items = sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
-                lines = [(" " if i.is_dir() else " ") + i.name for i in items[:80]]
+                lines = ["📁 " + i.name if i.is_dir() else "   " + i.name for i in items[:80]]
                 self.preview.setPlainText("\n".join(lines) if lines else "(empty)")
             except Exception as e:
                 self.preview.setPlainText(f"Error: {e}")
         else:
-            try:
-                with open(path, 'r', errors='replace') as f:
-                    content = f.read(50000)
-                    if len(content) >= 50000:
-                        content += "\n\n... (truncated)"
-                    self.preview.setPlainText(content)
-            except Exception as e:
-                self.preview.setPlainText(f"Error: {e}")
+            # Use smart preview based on file type
+            category = get_file_category(path)
+
+            if category == "audio":
+                self.preview.setPlainText(preview_audio(path))
+            elif category == "video":
+                self.preview.setPlainText(preview_video(path))
+            elif category == "archive":
+                self.preview.setPlainText(preview_archive(path))
+            elif category == "binary":
+                self.preview.setPlainText(preview_binary(path))
+            else:
+                # Text file - show contents
+                try:
+                    with open(path, 'r', errors='replace') as f:
+                        content = f.read(50000)
+                        if len(content) >= 50000:
+                            content += "\n\n... (truncated)"
+                        self.preview.setPlainText(content)
+                except Exception as e:
+                    self.preview.setPlainText(f"Error: {e}")
 
     def _on_double_click(self, item):
         self._open_selected()
@@ -619,17 +1327,13 @@ class NixNavWindow(QWidget):
         row = self.list.currentRow()
         if 0 <= row < len(self._results_data):
             path, is_dir, _ = self._results_data[row]
-            mode = self._get_mode()
             try:
-                if mode == "edit":
-                    # Open file in Kate
-                    subprocess.Popen(["kate", path], start_new_session=True)
-                elif mode == "gotofile":
-                    # Open containing folder in Dolphin, with file selected
-                    subprocess.Popen(["dolphin", "--select", path], start_new_session=True)
-                elif mode == "gotodir":
+                if is_dir:
                     # Open folder in Dolphin
                     subprocess.Popen(["dolphin", path], start_new_session=True)
+                else:
+                    # Open file with default application
+                    subprocess.Popen(["xdg-open", path], start_new_session=True)
                 self.close()
                 self.closed.emit()
             except Exception as e:
@@ -645,6 +1349,56 @@ class NixNavWindow(QWidget):
                 self.closed.emit()
             except Exception as e:
                 self.status.setText(f"Error: {e}")
+
+    def _rescan_bookmark(self):
+        """Rescan current bookmark's directory with real-time progress."""
+        import threading
+
+        path = self._get_path()
+        self.status.setText("Rescanning...")
+        self.status.setStyleSheet("color: #e6a855; font-size: 11px;")  # Orange during scan
+
+        def do_rescan():
+            try:
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                sock.settimeout(600)  # 10 min timeout for large directories
+                sock.connect(DAEMON_SOCKET)
+                sock.sendall(f"RESCAN {path}\n".encode())
+
+                response = b""
+                while b"\n" not in response:
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        break
+                    response += chunk
+
+                sock.close()
+
+                data = json.loads(response.decode().strip())
+                indexed = data.get("indexed", 0)
+
+                # Update UI from main thread
+                QTimer.singleShot(0, lambda: self._on_rescan_complete(indexed))
+
+            except Exception as e:
+                QTimer.singleShot(0, lambda: self._on_rescan_error(str(e)))
+
+        thread = threading.Thread(target=do_rescan, daemon=True)
+        thread.start()
+
+    def _on_rescan_complete(self, indexed: int):
+        """Called when rescan completes."""
+        self.status.setStyleSheet("color: #66bb6a; font-size: 11px;")  # Green on success
+        self.status.setText(f"Rescanned: {indexed:,} files")
+        # Reset status color after 2 seconds and refresh results
+        QTimer.singleShot(2000, lambda: self.status.setStyleSheet("color: #666; font-size: 11px;"))
+        QTimer.singleShot(100, self._refresh)
+
+    def _on_rescan_error(self, error: str):
+        """Called when rescan fails."""
+        self.status.setStyleSheet("color: #ef5350; font-size: 11px;")  # Red on error
+        self.status.setText(f"Rescan failed: {error}")
+        QTimer.singleShot(3000, lambda: self.status.setStyleSheet("color: #666; font-size: 11px;"))
 
 
 def get_socket_path() -> str:
@@ -748,19 +1502,6 @@ class NixNavApp(QObject):
         self.tray_menu.addAction(open_action)
         self.tray_menu.addSeparator()
 
-        edit_action = QAction("Edit File", self.tray_menu)
-        edit_action.triggered.connect(lambda: self._show_mode("edit"))
-        self.tray_menu.addAction(edit_action)
-
-        gotofile_action = QAction("Go to File", self.tray_menu)
-        gotofile_action.triggered.connect(lambda: self._show_mode("gotofile"))
-        self.tray_menu.addAction(gotofile_action)
-
-        gotodir_action = QAction("Go to Folder", self.tray_menu)
-        gotodir_action.triggered.connect(lambda: self._show_mode("gotodir"))
-        self.tray_menu.addAction(gotodir_action)
-
-        self.tray_menu.addSeparator()
         quit_action = QAction("Quit", self.tray_menu)
         quit_action.triggered.connect(self.quit)
         self.tray_menu.addAction(quit_action)
@@ -799,10 +1540,6 @@ class NixNavApp(QObject):
             self.window.close()
         else:
             self.show_window()
-
-    def _show_mode(self, mode: str):
-        self.config.data["last_mode"] = mode
-        self.show_window()
 
     def _on_closed(self):
         pass

@@ -1,0 +1,42 @@
+[package]
+name = "nixnav-daemon"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance file indexing daemon for NixNav"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# File system watching (uses inotify on Linux)
+notify = { version = "6", features = ["serde"] }
+
+# SQLite for persistence
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Directory traversal (faster than std)
+walkdir = "2"
+ignore = "0.4"  # Respects .gitignore, fast traversal
+
+# Unix socket
+tokio-stream = "0.1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Path handling
+dirs = "5"
+
+# For detecting mount points
+nix = { version = "0.28", features = ["fs", "mount"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

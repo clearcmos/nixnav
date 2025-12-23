@@ -4,7 +4,24 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-NixNav is a GUI file navigator for NixOS/KDE Wayland built with Python and PySide6 (Qt6). It's the GUI equivalent of the `fcd`, `fcat` terminal commands defined in `/etc/nixos/modules/core/dev/fzf.nix`.
+NixNav is a GUI file navigator for NixOS/KDE Wayland built with Python and PySide6 (Qt6), backed by a high-performance Rust daemon for instant search across millions of files. It's the GUI equivalent of the `fcd`, `fcat` terminal commands defined in `/etc/nixos/modules/core/dev/fzf.nix`.
+
+## Architecture
+
+**Two-component system:**
+
+1. **`nixnav-daemon`** (Rust) - Background indexing daemon
+   - Trigram-based posting lists for instant substring search
+   - SQLite persistence for index cache
+   - inotify for real-time local filesystem updates
+   - Periodic integrity checker for detecting bulk deletes
+   - Unix socket API at `/run/user/1000/nixnav-daemon.sock`
+
+2. **`main.py`** (Python/Qt) - GUI application
+   - **DaemonClient**: Communicates with daemon via Unix socket
+   - **FileScanner**: Background thread with daemon query (fallback to `fd`)
+   - **NixNavWindow**: Main window with search, results list, and smart preview panel
+   - **NixNavApp**: Application controller managing system tray, window, and IPC
 
 ## Development Commands
 
@@ -12,7 +29,10 @@ NixNav is a GUI file navigator for NixOS/KDE Wayland built with Python and PySid
 # Enter development shell
 nix develop
 
-# Run the app
+# Build the daemon
+cd daemon && cargo build --release
+
+# Run the app (daemon auto-starts)
 python main.py
 
 # Or run directly with flake
@@ -25,59 +45,52 @@ nix build
 ./nixnav-toggle
 ```
 
-## Architecture
-
-**Single-file application** (`main.py`) with these main classes:
-
-- **Config**: Manages bookmarks, exclude patterns, and settings in `~/.config/nixnav/config.json`
-- **FileScanner(QObject)**: Background thread using `fd` for file/folder scanning (filters binary files in edit mode)
-- **NixNavWindow(QWidget)**: Main window with search, results list, and preview panel
-- **NixNavApp**: Application controller managing system tray, window, and IPC socket
-
-### Why fd?
-
-Initial implementation used Python's `pathlib.rglob()` which was slow (~2-5s for large directories). Switched to subprocess calls to `fd` (Rust binary) for 50-100x speedup.
-
-### IPC Toggle Mechanism
-
-The app creates a Unix socket at `$XDG_RUNTIME_DIR/nixnav.sock` for instant window toggling:
-
-1. **Server side** (`main.py`): Timer polls socket, emits Qt signal on "toggle" message
-2. **Client side** (`nixnav-toggle`): Minimal Python script sends "toggle" to socket, exits immediately
-3. **Why not QLocalSocket?** Direct Unix sockets avoid Qt overhead for sub-50ms response time
-
 ## Key Features
 
-- **Three modes**: Edit, File, Dir - switchable via Tab or mode buttons
-- **Edit mode**: Filters out binary files (images, audio, compiled, etc.) for clean text-file search
+- **Instant search**: Trigram index enables sub-10ms search across 600k+ files
+- **Unified search**: Searches both files and directories in one query
+- **Smart previews**: Context-aware preview panel based on file type
 - **Bookmarks**: Configurable directories to search within
-- **Live preview**: Right panel shows file contents as you navigate
-- **Background scanning**: File search runs in separate thread to keep UI responsive
-- **Wayland native**: Uses `QT_QPA_PLATFORM=wayland;xcb` - window centers on screen each toggle
-- **No flash on search**: Uses `setUpdatesEnabled()` to batch UI updates atomically
-- **Window size remembered**: Size persists between sessions (position centers on Wayland)
+- **Auto-indexing**: Daemon auto-starts and indexes bookmarks on launch
+- **Real-time updates**: inotify watches for file changes
+- **Integrity checker**: Periodic verification catches bulk deletes
+- **Wayland native**: Centers on screen each toggle
 - **System tray**: Left-click opens overlay, right-click for menu
-- **Keyboard-centric**: Arrow keys navigate, Enter opens, Tab cycles modes, Esc closes
+- **Keyboard-centric**: Arrow keys navigate, Enter opens, Esc closes
 
 ## Keyboard Shortcuts
 
-- `Arrow Up/Down` - Navigate results
-- `Enter` - Execute mode action
-- `Ctrl+O` - Open containing folder in Dolphin
-- `Tab` - Cycle through modes (Edit → File → Dir)
-- `Esc` - Close overlay
+| Key | Action |
+|-----|--------|
+| `Arrow Up/Down` | Navigate results |
+| `Enter` | Open file (xdg-open) or folder (Dolphin) |
+| `Ctrl+O` | Open containing folder in Dolphin |
+| `Ctrl+R` | Rescan current bookmark (refresh index) |
+| `Esc` | Close overlay |
 
-## Modes and Actions
+## Smart Preview System
 
-| Mode | Button | Searches | Enter Action |
-|------|--------|----------|--------------|
-| Edit | `Edit` | Text files only | Open file in Kate |
-| File | `File` | All files | Open containing folder in Dolphin |
-| Dir | `Dir` | Directories | Open folder in Dolphin |
+The preview panel shows context-appropriate content based on file type:
+
+| File Type | Preview Shows |
+|-----------|--------------|
+| Directories | Folder contents listing |
+| Text files | File contents (up to 50KB) |
+| Binary files | File info (name, size, type, dimensions for images) |
+| Audio (MP3, FLAC, etc.) | ID3 tags, duration, bitrate, codec, sample rate |
+| Video (MKV, MP4, etc.) | Duration, resolution, frame rate, audio tracks, subtitles |
+| Archives (ZIP, TAR, etc.) | Contents listing with file sizes |
+
+Requires `ffprobe` (from ffmpeg) for audio/video metadata.
 
 ## Data Locations
 
-- Config: `~/.config/nixnav/config.json`
+| Data | Location |
+|------|----------|
+| GUI Config | `~/.config/nixnav/config.json` |
+| Daemon Index | `~/.local/share/nixnav/index.db` |
+| GUI Socket | `$XDG_RUNTIME_DIR/nixnav.sock` |
+| Daemon Socket | `$XDG_RUNTIME_DIR/nixnav-daemon.sock` |
 
 ## Config Structure
 
@@ -87,30 +100,43 @@ The app creates a Unix socket at `$XDG_RUNTIME_DIR/nixnav.sock` for instant wind
     {"name": "home", "path": "/home/nicholas"}
   ],
   "last_bookmark": 0,
-  "last_mode": "edit",
-  "exclude_patterns": ["*.pyc", "__pycache__", ".git", "node_modules", "*.log"],
+  "exclude_patterns": ["*.pyc", "__pycache__", ".git", "node_modules", "*.log", ".Trash*", "Trash"],
   "max_results": 500,
   "window_geometry": "<base64 encoded Qt geometry>"
 }
 ```
 
+## Daemon Exclude Patterns
+
+The daemon automatically excludes:
+- `.git`, `node_modules`, `__pycache__`, `.cache`, `.npm`, `.cargo`
+- `target`, `build`, `dist`, `.next`, `.nuxt`
+- `.Trash*`, `Trash` (all trash folders)
+
 ## Bookmark Management
 
 - **Add**: Click the + button next to the dropdown
 - **Rename/Delete**: Right-click on the bookmark dropdown for context menu
-- Default bookmark is just "home" (user's home directory)
+- **Auto-sync**: Bookmarks are automatically indexed by daemon on launch
 
-## Binary File Filtering (Edit Mode)
+## IPC Protocol
 
-Edit mode excludes these file types for a cleaner editing experience:
-- Images: png, jpg, jpeg, gif, bmp, ico, webp, svg
-- Audio/Video: mp3, mp4, wav, avi, mkv, mov, flac, ogg
-- Documents: pdf, doc, docx, xls, xlsx, ppt, pptx
-- Archives: zip, tar, gz, bz2, xz, 7z, rar
-- Compiled: exe, dll, so, dylib, a, o, obj, class, jar, pyc
-- Fonts: ttf, otf, woff, woff2, eot
-- Data: bin, dat, db, sqlite, sqlite3
-- Minified: min.js, min.css
+### GUI Toggle Socket
+```
+$XDG_RUNTIME_DIR/nixnav.sock
+Command: "toggle" -> Show/hide window
+```
+
+### Daemon Socket
+```
+$XDG_RUNTIME_DIR/nixnav-daemon.sock
+Commands:
+  PING -> {"status": "pong"}
+  STATS -> {"files": N, "trigrams": N, "bookmarks": N}
+  SEARCH {"bookmark_path": "...", "mode": "all", "query": "...", "extension": null}
+  RESCAN /path -> {"status": "ok", "indexed": N}
+  ADD_BOOKMARK {"name": "...", "path": "...", "is_network": false}
+```
 
 ## Wayland Considerations
 
@@ -119,15 +145,9 @@ Wayland does not allow applications to set their own window positions (security 
 - **Centering** the window on the primary screen each time it's shown
 - This provides predictable, consistent UX similar to KRunner
 
-## Comparison to Terminal Commands
-
-| Terminal | NixNav Mode | Action |
-|----------|-------------|--------|
-| `fcd` | Dir | Opens selected folder in Dolphin |
-| `fcat` | Edit | Preview panel shows contents, Enter opens in Kate |
-
 ## Known Behaviors
 
-- **Max results**: Limited to 500 items to keep performance snappy
-- **Exclude patterns**: Skips .git, node_modules, __pycache__ etc by default
-- **Thread cleanup**: Uses `deleteLater()` to prevent Qt object lifetime crashes
+- **Max results**: Limited to 2000 items from daemon
+- **Integrity check**: Runs every 60 seconds, checks 5000 files per cycle
+- **Network mounts**: Rescanned every 5 minutes (no inotify support)
+- **Daemon auto-start**: GUI starts daemon if not running
