@@ -77,9 +77,24 @@ struct Bookmark {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SearchRequest {
     bookmark_path: String,
-    mode: String,  // "edit", "gotofile", "gotodir"
+    mode: String,  // "edit", "gotofile", "gotodir", "all"
     query: String,
     extension: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SearchAllRequest {
+    bookmark_paths: Vec<String>,  // Empty = search all indexed files
+    query: String,
+    extension: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SearchAllResult {
+    path: String,
+    is_dir: bool,
+    mtime: i64,
+    bookmark: String,  // Which bookmark this result belongs to
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -299,6 +314,95 @@ impl TrigramIndex {
         // Limit results
         results.truncate(MAX_RESULTS);
 
+        results
+    }
+
+    /// Search all bookmarks at once (much faster than multiple searches)
+    fn search_all(&self, req: &SearchAllRequest) -> Vec<SearchAllResult> {
+        let query_lower = req.query.to_lowercase();
+        let trigrams = Self::extract_trigrams(&query_lower);
+
+        // Build bookmark path -> name mapping
+        let bookmark_map: HashMap<&str, &str> = self.bookmarks
+            .iter()
+            .map(|b| (b.path.as_str(), b.name.as_str()))
+            .collect();
+
+        // Determine which bookmark paths to search
+        let search_paths: Vec<&str> = if req.bookmark_paths.is_empty() {
+            // Search all bookmarks
+            self.bookmarks.iter().map(|b| b.path.as_str()).collect()
+        } else {
+            req.bookmark_paths.iter().map(|s| s.as_str()).collect()
+        };
+
+        // Get candidate file IDs from trigram intersection
+        let candidates: HashSet<u32> = if trigrams.is_empty() {
+            // Empty or short query - return all files
+            self.files.keys().copied().collect()
+        } else {
+            // Intersect posting lists for all trigrams
+            let mut iter = trigrams.iter();
+            let first = iter.next().unwrap();
+            let mut candidates = self.trigrams
+                .get(first)
+                .cloned()
+                .unwrap_or_default();
+
+            for trigram in iter {
+                if let Some(set) = self.trigrams.get(trigram) {
+                    candidates = candidates.intersection(set).copied().collect();
+                } else {
+                    return Vec::new();
+                }
+                if candidates.is_empty() {
+                    return Vec::new();
+                }
+            }
+            candidates
+        };
+
+        // Filter candidates and determine bookmark for each
+        let mut results: Vec<SearchAllResult> = candidates
+            .into_iter()
+            .filter_map(|id| self.files.get(&id))
+            .filter_map(|entry| {
+                // Find which bookmark this file belongs to
+                let bookmark_name = search_paths.iter()
+                    .find(|&bp| entry.path.starts_with(bp))
+                    .and_then(|bp| bookmark_map.get(bp).copied())?;
+
+                // Extension filter
+                if let Some(ref ext_filter) = req.extension {
+                    if let Some(ext) = Path::new(&entry.path).extension().and_then(|e| e.to_str()) {
+                        if ext.to_lowercase() != ext_filter.to_lowercase() {
+                            return None;
+                        }
+                    } else {
+                        return None;
+                    }
+                }
+
+                // Verify actual substring match
+                if !req.query.is_empty() {
+                    let path_lower = entry.path.to_lowercase();
+                    if !path_lower.contains(&query_lower) {
+                        return None;
+                    }
+                }
+
+                Some(SearchAllResult {
+                    path: entry.path.clone(),
+                    is_dir: entry.is_dir,
+                    mtime: entry.mtime,
+                    bookmark: bookmark_name.to_string(),
+                })
+            })
+            .collect();
+
+        // Sort by mtime descending
+        results.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+        results.truncate(MAX_RESULTS);
         results
     }
 
@@ -745,7 +849,27 @@ fn handle_client(
 
                 debug!("Received: {}", line);
 
-                let response = if line.starts_with("SEARCH ") {
+                let response = if line.starts_with("SEARCH_ALL ") {
+                    // Fast unified search across all bookmarks
+                    let json = &line[11..];
+                    match serde_json::from_str::<SearchAllRequest>(json) {
+                        Ok(req) => {
+                            let start = std::time::Instant::now();
+                            let results = index.read().unwrap().search_all(&req);
+                            let elapsed = start.elapsed().as_millis() as u64;
+                            let total = index.read().unwrap().file_count();
+
+                            // Return as JSON with results array
+                            let resp = serde_json::json!({
+                                "results": results,
+                                "total_indexed": total,
+                                "search_time_ms": elapsed
+                            });
+                            serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string())
+                        }
+                        Err(e) => format!(r#"{{"error": "{}"}}"#, e),
+                    }
+                } else if line.starts_with("SEARCH ") {
                     let json = &line[7..];
                     match serde_json::from_str::<SearchRequest>(json) {
                         Ok(req) => {

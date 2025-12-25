@@ -16,15 +16,20 @@ import zipfile
 import tarfile
 from pathlib import Path
 from typing import Optional, List, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-    QLineEdit, QListWidget, QListWidgetItem, QLabel,
+    QLineEdit, QListView, QLabel,
     QTextEdit, QSystemTrayIcon, QMenu, QSplitter, QPushButton,
-    QComboBox, QInputDialog, QMessageBox
+    QComboBox, QInputDialog, QMessageBox, QDialog, QScrollArea,
+    QStackedWidget, QFrame, QStyledItemDelegate
 )
-from PySide6.QtCore import Qt, QTimer, Signal, QThread, QObject
-from PySide6.QtGui import QIcon, QAction, QFont, QKeySequence, QShortcut
+from PySide6.QtCore import (
+    Qt, QTimer, Signal, QThread, QObject, QSize,
+    QAbstractListModel, QModelIndex, QEvent
+)
+from PySide6.QtGui import QIcon, QAction, QFont, QKeySequence, QShortcut, QPixmap, QImage
 
 
 # Config paths
@@ -274,6 +279,49 @@ class DaemonClient:
         except:
             pass
         return False
+
+    def search_all_bookmarks(self, bookmarks: List[dict], query: str, extension: Optional[str] = None) -> Tuple[List[dict], int, int]:
+        """
+        Search all bookmarks in a single daemon call (fastest method).
+
+        Returns: (results, total_indexed, search_time_ms)
+        """
+        if not self.connect():
+            return [], 0, 0
+
+        try:
+            # Use the fast SEARCH_ALL command - single pass through index
+            request = {
+                "bookmark_paths": [bm["path"] for bm in bookmarks],
+                "query": query,
+                "extension": extension,
+            }
+            cmd = f"SEARCH_ALL {json.dumps(request)}\n"
+            self._socket.sendall(cmd.encode())
+
+            # Read response
+            response = b""
+            while True:
+                chunk = self._socket.recv(65536)
+                if not chunk:
+                    break
+                response += chunk
+                if b"\n" in response:
+                    break
+
+            data = json.loads(response.decode().strip())
+            if "error" in data:
+                return [], 0, 0
+
+            results = data.get("results", [])
+            total = data.get("total_indexed", 0)
+            time_ms = data.get("search_time_ms", 0)
+
+            return results, total, time_ms
+
+        except Exception:
+            self.disconnect()
+            return [], 0, 0
 
 
 # Global daemon client instance
@@ -789,13 +837,14 @@ class FileScanner(QObject):
     results_ready = Signal(list)
     finished = Signal()
 
-    def __init__(self, root_path: str, query: str, exclude_patterns: list, max_results: int, ext_filter: str = None):
+    def __init__(self, bookmarks: list, query: str, exclude_patterns: list, max_results: int, ext_filter: str = None, single_bookmark_path: str = None):
         super().__init__()
-        self.root_path = root_path
+        self.bookmarks = bookmarks  # List of {"name": ..., "path": ...}
         self.query = query
         self.exclude_patterns = exclude_patterns
         self.max_results = max_results
         self.ext_filter = ext_filter
+        self.single_bookmark_path = single_bookmark_path  # If set, only search this bookmark
         self._cancelled = False
         self._process = None
 
@@ -820,11 +869,28 @@ class FileScanner(QObject):
         global _daemon_client
 
         try:
-            results, total, time_ms = _daemon_client.search(
-                bookmark_path=self.root_path,
-                query=self.query,
-                extension=self.ext_filter,
-            )
+            if self.single_bookmark_path:
+                # Search single bookmark
+                results, total, time_ms = _daemon_client.search(
+                    bookmark_path=self.single_bookmark_path,
+                    query=self.query,
+                    extension=self.ext_filter,
+                )
+                # Find bookmark name for this path
+                bm_name = None
+                for bm in self.bookmarks:
+                    if bm["path"] == self.single_bookmark_path:
+                        bm_name = bm["name"]
+                        break
+                for r in results:
+                    r["bookmark"] = bm_name
+            else:
+                # Search all bookmarks
+                results, total, time_ms = _daemon_client.search_all_bookmarks(
+                    bookmarks=self.bookmarks,
+                    query=self.query,
+                    extension=self.ext_filter,
+                )
 
             if self._cancelled:
                 return True
@@ -833,7 +899,7 @@ class FileScanner(QObject):
                 self._daemon_search_time = time_ms
                 self._daemon_total_indexed = total
                 converted = [
-                    (r["path"], r.get("is_dir", False), r.get("mtime", 0))
+                    (r["path"], r.get("is_dir", False), r.get("mtime", 0), r.get("bookmark"))
                     for r in results
                 ]
                 self.results_ready.emit(converted)
@@ -848,54 +914,216 @@ class FileScanner(QObject):
     def _fd_search(self):
         """Fallback search using fd command."""
         results = []
-        try:
-            cmd = ["fd", "--color=never", "--absolute-path"]
 
-            # Search both files and directories
-            for pattern in self.exclude_patterns:
-                cmd.extend(["--exclude", pattern])
+        # Determine which paths to search
+        if self.single_bookmark_path:
+            search_items = [{"name": None, "path": self.single_bookmark_path}]
+        else:
+            search_items = self.bookmarks
 
-            if self.ext_filter:
-                cmd.extend(["--extension", self.ext_filter])
+        for bm in search_items:
+            root_path = bm["path"]
+            bm_name = bm.get("name")
 
-            cmd.extend(["--max-results", str(self.max_results)])
+            try:
+                cmd = ["fd", "--color=never", "--absolute-path"]
 
-            if self.query:
-                cmd.append(self.query)
-            else:
-                cmd.append(".")
+                for pattern in self.exclude_patterns:
+                    cmd.extend(["--exclude", pattern])
 
-            cmd.append(self.root_path)
+                if self.ext_filter:
+                    cmd.extend(["--extension", self.ext_filter])
 
-            self._process = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
-            )
-            stdout, _ = self._process.communicate(timeout=30)
+                cmd.extend(["--max-results", str(self.max_results)])
 
-            if self._cancelled:
-                return
+                if self.query:
+                    cmd.append(self.query)
+                else:
+                    cmd.append(".")
 
-            for line in stdout.strip().split('\n'):
-                if not line:
-                    continue
-                path = line.strip()
-                try:
-                    p = Path(path)
-                    is_dir = p.is_dir()
-                    mtime = p.stat().st_mtime
-                    results.append((path, is_dir, mtime))
-                except:
-                    results.append((path, False, 0))
+                cmd.append(root_path)
 
-        except subprocess.TimeoutExpired:
-            if self._process:
-                self._process.kill()
-        except Exception:
-            pass
+                self._process = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
+                )
+                stdout, _ = self._process.communicate(timeout=30)
+
+                if self._cancelled:
+                    return
+
+                for line in stdout.strip().split('\n'):
+                    if not line:
+                        continue
+                    path = line.strip()
+                    try:
+                        p = Path(path)
+                        is_dir = p.is_dir()
+                        mtime = p.stat().st_mtime
+                        results.append((path, is_dir, mtime, bm_name))
+                    except:
+                        results.append((path, False, 0, bm_name))
+
+            except subprocess.TimeoutExpired:
+                if self._process:
+                    self._process.kill()
+            except Exception:
+                pass
+
+        # Sort by mtime and limit
+        results.sort(key=lambda x: x[2], reverse=True)
+        results = results[:self.max_results]
 
         if not self._cancelled:
             self.results_ready.emit(results)
         self.finished.emit()
+
+
+class BookmarkManagerDialog(QDialog):
+    """Dialog for managing bookmarks (add/rename/delete)."""
+
+    def __init__(self, config: Config, parent=None):
+        super().__init__(parent)
+        self.config = config
+        self.setWindowTitle("Manage Bookmarks")
+        self.setModal(True)
+        self.resize(400, 300)
+        self.setStyleSheet("""
+            QDialog { background: #1e1e1e; color: #ccc; }
+            QListWidget { background: #252525; color: #ccc; border: 1px solid #444; }
+            QListWidget::item { padding: 6px; }
+            QListWidget::item:selected { background: #3a5a8a; }
+            QPushButton { background: #333; color: #ccc; border: 1px solid #444; padding: 6px 12px; border-radius: 3px; }
+            QPushButton:hover { background: #444; }
+            QLabel { color: #888; }
+        """)
+
+        layout = QVBoxLayout(self)
+
+        # Bookmark list
+        self.bookmark_list = QListWidget()
+        self._refresh_list()
+        layout.addWidget(self.bookmark_list)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+
+        add_btn = QPushButton("Add")
+        add_btn.clicked.connect(self._add_bookmark)
+        btn_layout.addWidget(add_btn)
+
+        rename_btn = QPushButton("Rename")
+        rename_btn.clicked.connect(self._rename_bookmark)
+        btn_layout.addWidget(rename_btn)
+
+        delete_btn = QPushButton("Delete")
+        delete_btn.clicked.connect(self._delete_bookmark)
+        btn_layout.addWidget(delete_btn)
+
+        btn_layout.addStretch()
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(close_btn)
+
+        layout.addLayout(btn_layout)
+
+        # Help text
+        help_label = QLabel("Tip: Use 'bookmark-name:query' to search a specific bookmark")
+        help_label.setStyleSheet("color: #666; font-size: 10px;")
+        layout.addWidget(help_label)
+
+    def _refresh_list(self):
+        self.bookmark_list.clear()
+        for bm in self.config.get_bookmarks():
+            self.bookmark_list.addItem(f"{bm['name']} - {bm['path']}")
+
+    def _add_bookmark(self):
+        path, ok = QInputDialog.getText(self, "Add Bookmark", "Directory path:", text=str(Path.home()))
+        if ok and path:
+            p = Path(path).expanduser()
+            if p.is_dir():
+                name, ok = QInputDialog.getText(self, "Bookmark Name", "Name:", text=p.name)
+                if ok and name:
+                    self.config.add_bookmark(name, str(p))
+                    self._refresh_list()
+                    # Tell daemon to index this path
+                    _daemon_client.add_bookmark(name, str(p))
+            else:
+                QMessageBox.warning(self, "Error", f"'{path}' is not a directory")
+
+    def _rename_bookmark(self):
+        idx = self.bookmark_list.currentRow()
+        bookmarks = self.config.get_bookmarks()
+        if 0 <= idx < len(bookmarks):
+            current_name = bookmarks[idx]["name"]
+            new_name, ok = QInputDialog.getText(self, "Rename Bookmark", "New name:", text=current_name)
+            if ok and new_name and new_name != current_name:
+                self.config.rename_bookmark(idx, new_name)
+                self._refresh_list()
+
+    def _delete_bookmark(self):
+        idx = self.bookmark_list.currentRow()
+        bookmarks = self.config.get_bookmarks()
+        if len(bookmarks) <= 1:
+            QMessageBox.warning(self, "Cannot Delete", "You must have at least one bookmark.")
+            return
+        if 0 <= idx < len(bookmarks):
+            name = bookmarks[idx]["name"]
+            reply = QMessageBox.question(self, "Delete Bookmark", f"Delete bookmark '{name}'?",
+                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                self.config.delete_bookmark(idx)
+                self._refresh_list()
+
+
+# Image extensions for preview
+IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "bmp", "webp", "tiff", "tif", "ico", "svg"}
+
+
+class ResultsModel(QAbstractListModel):
+    """
+    High-performance model for file results.
+    Uses QAbstractListModel for virtual scrolling - only visible items are rendered.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._results: List[Tuple[str, bool, str, str]] = []  # (path, is_dir, bookmark_name, display_text)
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        if parent.isValid():
+            return 0
+        return len(self._results)
+
+    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole):
+        if not index.isValid() or index.row() >= len(self._results):
+            return None
+
+        if role == Qt.ItemDataRole.DisplayRole:
+            return self._results[index.row()][3]  # display_text
+        return None
+
+    def set_results(self, results: List[Tuple[str, bool, str, str]]):
+        """Replace all results efficiently."""
+        self.beginResetModel()
+        self._results = results
+        self.endResetModel()
+
+    def clear(self):
+        """Clear all results."""
+        self.beginResetModel()
+        self._results = []
+        self.endResetModel()
+
+    def get_item(self, row: int) -> Optional[Tuple[str, bool, str]]:
+        """Get (path, is_dir, bookmark_name) for a row."""
+        if 0 <= row < len(self._results):
+            path, is_dir, bookmark_name, _ = self._results[row]
+            return (path, is_dir, bookmark_name)
+        return None
+
+    def result_count(self) -> int:
+        return len(self._results)
 
 
 class NixNavWindow(QWidget):
@@ -906,10 +1134,12 @@ class NixNavWindow(QWidget):
         self.config = config
         self._scanner_thread: Optional[QThread] = None
         self._scanner = None
-        self._results_data = []  # Store (path, is_dir, matches) for each item
+        self._current_filter_bookmark = None  # Bookmark name if filtering by prefix
+        self._resize_timer: Optional[QTimer] = None  # For debouncing resize events
+        self._last_selected_path: Optional[str] = None  # Cache for resize debounce
 
         self.setWindowTitle("NixNav")
-        self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
+        self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
 
         # Restore window size from config or use defaults
         geo = self.config.data.get("window_geometry")
@@ -931,34 +1161,49 @@ class NixNavWindow(QWidget):
         self.config.save()
         super().closeEvent(event)
 
+    def resizeEvent(self, event):
+        """Debounce preview updates on resize to improve performance."""
+        super().resizeEvent(event)
+        # Only refresh preview if we have a selected item
+        if self._last_selected_path:
+            if self._resize_timer is None:
+                self._resize_timer = QTimer()
+                self._resize_timer.setSingleShot(True)
+                self._resize_timer.timeout.connect(self._on_resize_debounced)
+            self._resize_timer.start(150)  # 150ms debounce
+
+    def _on_resize_debounced(self):
+        """Called after resize is complete (debounced)."""
+        row = self._get_current_row()
+        item = self.results_model.get_item(row) if hasattr(self, 'results_model') else None
+        if item:
+            path, is_dir, _ = item
+            self._show_preview(path, is_dir)
+
     def setup_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
-        # Top bar: bookmark selector
+        # Top bar: bookmark management button and status
         top = QHBoxLayout()
         top.setSpacing(8)
 
-        # Bookmark dropdown with context menu for rename/delete
-        self.bookmark_combo = QComboBox()
-        self.bookmark_combo.setStyleSheet("""
-            QComboBox { background: #252525; color: #ccc; border: 1px solid #444; padding: 4px 8px; border-radius: 3px; min-width: 140px; }
-            QComboBox::drop-down { border: none; }
-            QComboBox QAbstractItemView { background: #252525; color: #ccc; selection-background-color: #5c9ae6; }
+        # Bookmarks button (opens management dialog)
+        bookmarks_btn = QPushButton("Bookmarks")
+        bookmarks_btn.setToolTip("Manage bookmarks (add/rename/delete)")
+        bookmarks_btn.setStyleSheet("""
+            QPushButton { background: #333; color: #888; border: 1px solid #444; padding: 4px 12px; border-radius: 3px; }
+            QPushButton:hover { background: #444; color: #ccc; }
         """)
-        self.bookmark_combo.currentIndexChanged.connect(self._on_bookmark_changed)
-        self.bookmark_combo.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.bookmark_combo.customContextMenuRequested.connect(self._show_bookmark_context_menu)
-        top.addWidget(self.bookmark_combo)
+        bookmarks_btn.clicked.connect(self._show_bookmark_manager)
+        top.addWidget(bookmarks_btn)
 
-        # Add bookmark button
-        add_btn = QPushButton("+")
-        add_btn.setFixedWidth(28)
-        add_btn.setToolTip("Add bookmark")
-        add_btn.setStyleSheet("QPushButton { background: #333; color: #888; border: none; padding: 4px; border-radius: 3px; } QPushButton:hover { background: #444; }")
-        add_btn.clicked.connect(self._add_bookmark)
-        top.addWidget(add_btn)
+        # Bookmark names hint label
+        self.bookmark_hint = QLabel()
+        self.bookmark_hint.setStyleSheet("color: #555; font-size: 10px;")
+        self._update_bookmark_hint()
+        top.addWidget(self.bookmark_hint)
 
         top.addStretch()
 
@@ -980,47 +1225,108 @@ class NixNavWindow(QWidget):
         layout.addWidget(self.search)
 
         # Content: list + preview
-        self.splitter = QSplitter(Qt.Horizontal)
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        # Results list - compact
-        self.list = QListWidget()
+        # Results list - using QListView with model for performance
+        self.results_model = ResultsModel(self)
+        self.list = QListView()
+        self.list.setModel(self.results_model)
         self.list.setStyleSheet("""
-            QListWidget { background: #1a1a1a; color: #ccc; border: none; font-family: monospace; font-size: 12px; }
-            QListWidget::item { padding: 3px 6px; border-bottom: 1px solid #252525; }
-            QListWidget::item:selected { background: #2a4a6a; color: #fff; }
-            QListWidget::item:hover:!selected { background: #252525; }
+            QListView { background: #1a1a1a; color: #ccc; border: none; font-family: monospace; font-size: 12px; }
+            QListView::item { padding: 3px 6px; border-bottom: 1px solid #252525; }
+            QListView::item:selected { background: #2a4a6a; color: #fff; }
+            QListView::item:hover:!selected { background: #252525; }
         """)
-        self.list.currentRowChanged.connect(self._on_selection_changed)
-        self.list.itemDoubleClicked.connect(self._on_double_click)
+        # Performance optimizations
+        self.list.setUniformItemSizes(True)  # 10x faster scrolling
+        self.list.setLayoutMode(QListView.LayoutMode.Batched)
+        self.list.setBatchSize(100)
+        # Connect selection signal
+        self.list.selectionModel().currentChanged.connect(self._on_selection_changed)
+        self.list.doubleClicked.connect(self._on_double_click)
         self.splitter.addWidget(self.list)
 
-        # Preview
-        self.preview = QTextEdit()
-        self.preview.setReadOnly(True)
-        self.preview.setStyleSheet("""
+        # Preview - stacked widget for different preview types
+        self.preview_stack = QStackedWidget()
+
+        # Text preview (index 0)
+        self.preview_text = QTextEdit()
+        self.preview_text.setReadOnly(True)
+        self.preview_text.setStyleSheet("""
             QTextEdit { background: #1e1e1e; color: #bbb; border: none; font-size: 11px; font-family: monospace; padding: 8px; }
         """)
-        self.splitter.addWidget(self.preview)
+        self.preview_stack.addWidget(self.preview_text)
+
+        # Image preview (index 1)
+        self.preview_image_scroll = QScrollArea()
+        self.preview_image_scroll.setStyleSheet("QScrollArea { background: #1e1e1e; border: none; }")
+        self.preview_image_scroll.setWidgetResizable(True)
+        self.preview_image_label = QLabel()
+        self.preview_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_image_label.setStyleSheet("QLabel { background: #1e1e1e; }")
+        self.preview_image_scroll.setWidget(self.preview_image_label)
+        self.preview_stack.addWidget(self.preview_image_scroll)
+
+        # PDF preview (index 2)
+        self.preview_pdf_scroll = QScrollArea()
+        self.preview_pdf_scroll.setStyleSheet("QScrollArea { background: #1e1e1e; border: none; }")
+        self.preview_pdf_scroll.setWidgetResizable(True)
+        self.preview_pdf_container = QWidget()
+        self.preview_pdf_layout = QVBoxLayout(self.preview_pdf_container)
+        self.preview_pdf_layout.setSpacing(10)
+        self.preview_pdf_layout.setContentsMargins(10, 10, 10, 10)
+        self.preview_pdf_scroll.setWidget(self.preview_pdf_container)
+        self.preview_stack.addWidget(self.preview_pdf_scroll)
+
+        # Audio preview with album art (index 3)
+        self.preview_audio_scroll = QScrollArea()
+        self.preview_audio_scroll.setStyleSheet("QScrollArea { background: #1e1e1e; border: none; }")
+        self.preview_audio_scroll.setWidgetResizable(True)
+        self.preview_audio_container = QWidget()
+        self.preview_audio_layout = QVBoxLayout(self.preview_audio_container)
+        self.preview_audio_layout.setSpacing(10)
+        self.preview_audio_layout.setContentsMargins(10, 10, 10, 10)
+        self.preview_audio_scroll.setWidget(self.preview_audio_container)
+        self.preview_stack.addWidget(self.preview_audio_scroll)
+
+        self.splitter.addWidget(self.preview_stack)
 
         self.splitter.setSizes([500, 500])
         layout.addWidget(self.splitter, 1)
 
         # Help line
-        help_lbl = QLabel("Enter: Open | Ctrl+O: Open folder | Ctrl+R: Refresh index | Esc: Close")
+        help_lbl = QLabel("Enter: Open | Ctrl+O: Open folder | Ctrl+R: Refresh all | bookmark:query to filter | Esc: Close")
         help_lbl.setStyleSheet("color: #444; font-size: 10px;")
-        help_lbl.setAlignment(Qt.AlignCenter)
+        help_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(help_lbl)
 
         # Window styling
         self.setStyleSheet("NixNavWindow { background: #141414; }")
 
+    def _update_bookmark_hint(self):
+        """Update the bookmark hint label with available prefixes."""
+        bookmarks = self.config.get_bookmarks()
+        if bookmarks:
+            names = [bm["name"] for bm in bookmarks]
+            self.bookmark_hint.setText(f"Prefixes: {', '.join(names)}")
+        else:
+            self.bookmark_hint.setText("")
+
+    def _show_bookmark_manager(self):
+        """Show the bookmark management dialog."""
+        dialog = BookmarkManagerDialog(self.config, self)
+        dialog.exec()
+        self._update_bookmark_hint()
+        self._sync_bookmarks_to_daemon()
+        self._refresh()
+
     def setup_shortcuts(self):
         QShortcut(QKeySequence("Ctrl+O"), self).activated.connect(self._open_folder)
-        QShortcut(QKeySequence("Ctrl+R"), self).activated.connect(self._rescan_bookmark)
+        QShortcut(QKeySequence("Ctrl+R"), self).activated.connect(self._rescan_all_bookmarks)
 
     def showEvent(self, event):
         super().showEvent(event)
-        self._load_bookmarks()
+        self._update_bookmark_hint()
         self.search.setFocus()
         # Sync bookmarks to daemon (in background)
         self._sync_bookmarks_to_daemon()
@@ -1059,20 +1365,31 @@ class NixNavWindow(QWidget):
         thread = threading.Thread(target=sync, daemon=True)
         thread.start()
 
+    def _get_current_row(self) -> int:
+        """Get current selected row in the list."""
+        index = self.list.currentIndex()
+        return index.row() if index.isValid() else -1
+
+    def _set_current_row(self, row: int):
+        """Set current selected row in the list."""
+        if 0 <= row < self.results_model.result_count():
+            index = self.results_model.index(row, 0)
+            self.list.setCurrentIndex(index)
+
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape:
+        if event.key() == Qt.Key.Key_Escape:
             self._cancel_scan()
             self.close()
             self.closed.emit()
-        elif event.key() == Qt.Key_Down:
-            row = self.list.currentRow()
-            if row < self.list.count() - 1:
-                self.list.setCurrentRow(row + 1)
-        elif event.key() == Qt.Key_Up:
-            row = self.list.currentRow()
+        elif event.key() == Qt.Key.Key_Down:
+            row = self._get_current_row()
+            if row < self.results_model.result_count() - 1:
+                self._set_current_row(row + 1)
+        elif event.key() == Qt.Key.Key_Up:
+            row = self._get_current_row()
             if row > 0:
-                self.list.setCurrentRow(row - 1)
-        elif event.key() in (Qt.Key_Return, Qt.Key_Enter):
+                self._set_current_row(row - 1)
+        elif event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             self._open_selected()
         elif event.text() and event.text().isprintable():
             # Forward printable keys to search field (type anywhere to search)
@@ -1083,107 +1400,35 @@ class NixNavWindow(QWidget):
         else:
             super().keyPressEvent(event)
 
-    def _load_bookmarks(self):
-        self.bookmark_combo.blockSignals(True)
-        self.bookmark_combo.clear()
-        for bm in self.config.get_bookmarks():
-            self.bookmark_combo.addItem(bm["name"], bm["path"])
-        idx = self.config.data.get("last_bookmark", 0)
-        if 0 <= idx < self.bookmark_combo.count():
-            self.bookmark_combo.setCurrentIndex(idx)
-        self.bookmark_combo.blockSignals(False)
-
-    def _on_bookmark_changed(self, idx):
-        self.config.data["last_bookmark"] = idx
-        self.config.save()
-        self._refresh()
-
-    def _add_bookmark(self):
-        path, ok = QInputDialog.getText(self, "Add Bookmark", "Directory path:", text=self._get_path())
-        if ok and path:
-            p = Path(path).expanduser()
-            if p.is_dir():
-                name, ok = QInputDialog.getText(self, "Bookmark Name", "Name:", text=p.name)
-                if ok and name:
-                    self.config.add_bookmark(name, str(p))
-                    self._load_bookmarks()
-                    self.bookmark_combo.setCurrentIndex(self.bookmark_combo.count() - 1)
-                    # Tell daemon to index this path
-                    _daemon_client.add_bookmark(name, str(p))
-            else:
-                QMessageBox.warning(self, "Error", f"'{path}' is not a directory")
-
-    def _show_bookmark_context_menu(self, pos):
-        idx = self.bookmark_combo.currentIndex()
-        if idx < 0:
-            return
-
-        menu = QMenu(self)
-        menu.setStyleSheet("""
-            QMenu { background: #252525; color: #ccc; border: 1px solid #444; }
-            QMenu::item { padding: 6px 20px; }
-            QMenu::item:selected { background: #5c9ae6; }
-        """)
-
-        rename_action = QAction("Rename", self)
-        rename_action.triggered.connect(lambda: self._rename_bookmark(idx))
-        menu.addAction(rename_action)
-
-        delete_action = QAction("Delete", self)
-        delete_action.triggered.connect(lambda: self._delete_bookmark(idx))
-        menu.addAction(delete_action)
-
-        menu.exec(self.bookmark_combo.mapToGlobal(pos))
-
-    def _rename_bookmark(self, idx: int):
-        bookmarks = self.config.get_bookmarks()
-        if 0 <= idx < len(bookmarks):
-            current_name = bookmarks[idx]["name"]
-            new_name, ok = QInputDialog.getText(self, "Rename Bookmark", "New name:", text=current_name)
-            if ok and new_name and new_name != current_name:
-                self.config.rename_bookmark(idx, new_name)
-                self._load_bookmarks()
-
-    def _delete_bookmark(self, idx: int):
-        bookmarks = self.config.get_bookmarks()
-        if len(bookmarks) <= 1:
-            QMessageBox.warning(self, "Cannot Delete", "You must have at least one bookmark.")
-            return
-        if 0 <= idx < len(bookmarks):
-            name = bookmarks[idx]["name"]
-            reply = QMessageBox.question(self, "Delete Bookmark", f"Delete bookmark '{name}'?",
-                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-            if reply == QMessageBox.Yes:
-                self.config.delete_bookmark(idx)
-                self._load_bookmarks()
-                self._refresh()
-
-    def _get_path(self) -> str:
-        idx = self.bookmark_combo.currentIndex()
-        return self.bookmark_combo.itemData(idx) if idx >= 0 else str(Path.home())
-
     def _parse_query(self, text: str):
         """Parse query for bookmark prefix and extension filter.
 
         Examples:
+            "home:foo" -> bookmark="home", query="foo", ext=None
             "home: foo" -> bookmark="home", query="foo", ext=None
-            "data: *.md bar" -> bookmark="data", query="bar", ext="md"
+            "data:*.md bar" -> bookmark="data", query="bar", ext="md"
             "*.py test" -> bookmark=None, query="test", ext="py"
             "simple query" -> bookmark=None, query="simple query", ext=None
         """
         text = text.strip()
         bookmark_name = None
+        bookmark_path = None
         ext_filter = None
         query = text
 
-        # Check for bookmark prefix (e.g., "home: query")
-        if ": " in text:
-            prefix, rest = text.split(": ", 1)
+        # Check for bookmark prefix (e.g., "home:query" or "home: query")
+        # Must check if what comes before : matches a bookmark name
+        if ":" in text:
+            colon_pos = text.index(":")
+            prefix = text[:colon_pos].strip()
+            rest = text[colon_pos + 1:].strip()  # Everything after the colon
+
             # Check if prefix matches a bookmark name (case-insensitive)
-            for i, bm in enumerate(self.config.get_bookmarks()):
+            for bm in self.config.get_bookmarks():
                 if bm["name"].lower() == prefix.lower():
-                    bookmark_name = prefix
-                    query = rest.strip()
+                    bookmark_name = bm["name"]
+                    bookmark_path = bm["path"]
+                    query = rest
                     break
 
         # Check for extension filter (e.g., "*.md" or "*.py")
@@ -1192,20 +1437,9 @@ class NixNavWindow(QWidget):
             ext_filter = ext_match.group(1)
             query = re.sub(r'\*\.\w+\s*', '', query).strip()
 
-        return bookmark_name, query, ext_filter
+        return bookmark_name, bookmark_path, query, ext_filter
 
     def _on_search_changed(self, text: str):
-        # Check for bookmark prefix and switch if found
-        bookmark_name, _, _ = self._parse_query(text)
-        if bookmark_name:
-            for i in range(self.bookmark_combo.count()):
-                if self.bookmark_combo.itemText(i).lower() == bookmark_name.lower():
-                    if self.bookmark_combo.currentIndex() != i:
-                        self.bookmark_combo.blockSignals(True)
-                        self.bookmark_combo.setCurrentIndex(i)
-                        self.bookmark_combo.blockSignals(False)
-                    break
-
         if hasattr(self, '_timer'):
             self._timer.stop()
         else:
@@ -1232,18 +1466,26 @@ class NixNavWindow(QWidget):
         # Don't clear list/preview here - wait until results arrive to avoid flash
 
         raw_query = self.search.text().strip()
-        _, query, ext_filter = self._parse_query(raw_query)
-        root = self._get_path()
+        bookmark_name, bookmark_path, query, ext_filter = self._parse_query(raw_query)
+
+        # Store current filter bookmark for display purposes
+        self._current_filter_bookmark = bookmark_name
 
         self.status.setText("...")
-        self._start_scan(root, query, ext_filter)
+        self._start_scan(query, ext_filter, bookmark_path)
 
-    def _start_scan(self, root: str, query: str, ext_filter: str = None):
+    def _start_scan(self, query: str, ext_filter: str = None, single_bookmark_path: str = None):
+        bookmarks = self.config.get_bookmarks()
+
         self._scanner_thread = QThread()
-        self._scanner = FileScanner(root, query,
-                                    self.config.data.get("exclude_patterns", []),
-                                    self.config.data.get("max_results", 500),
-                                    ext_filter)
+        self._scanner = FileScanner(
+            bookmarks=bookmarks,
+            query=query,
+            exclude_patterns=self.config.data.get("exclude_patterns", []),
+            max_results=self.config.data.get("max_results", 500),
+            ext_filter=ext_filter,
+            single_bookmark_path=single_bookmark_path
+        )
         self._scanner.moveToThread(self._scanner_thread)
         self._scanner_thread.started.connect(self._scanner.run)
         self._scanner.results_ready.connect(self._on_file_results)
@@ -1251,25 +1493,34 @@ class NixNavWindow(QWidget):
         self._scanner_thread.start()
 
     def _on_file_results(self, results: list):
-        results.sort(key=lambda x: x[2], reverse=True)  # Sort by mtime
-        root = self._get_path()
+        # Results are already sorted by mtime from the scanner
+        # Format: (path, is_dir, mtime, bookmark_name)
 
-        # Batch updates to prevent visual flash
-        self.list.setUpdatesEnabled(False)
-        self.list.clear()
-        self._results_data.clear()
+        # Build a map of bookmark paths for relativizing
+        bookmark_paths = {bm["name"]: bm["path"] for bm in self.config.get_bookmarks()}
 
-        for path, is_dir, mtime in results:
-            # Show relative path if under root
-            try:
-                rel = str(Path(path).relative_to(root))
-            except:
-                rel = path
-            item = QListWidgetItem(rel)
-            self.list.addItem(item)
-            self._results_data.append((path, is_dir, None))
+        # Build model data efficiently
+        model_data = []
+        for result in results:
+            path, is_dir, mtime, bookmark_name = result
+            # Show relative path from bookmark root, with bookmark prefix
+            display_path = path
+            if bookmark_name and bookmark_name in bookmark_paths:
+                root = bookmark_paths[bookmark_name]
+                try:
+                    rel = str(Path(path).relative_to(root))
+                    # Show bookmark prefix if not filtering by a single bookmark
+                    if self._current_filter_bookmark is None and len(bookmark_paths) > 1:
+                        display_path = f"[{bookmark_name}] {rel}"
+                    else:
+                        display_path = rel
+                except:
+                    display_path = path
 
-        self.list.setUpdatesEnabled(True)
+            model_data.append((path, is_dir, bookmark_name, display_path))
+
+        # Update model in one operation (triggers single view refresh)
+        self.results_model.set_results(model_data)
 
         # Show result count and search time if available
         status_text = str(len(results))
@@ -1280,53 +1531,248 @@ class NixNavWindow(QWidget):
                 status_text = f"{len(results)} ({time_ms}ms, {total:,} indexed)"
         self.status.setText(status_text)
 
-        if self.list.count() > 0:
-            self.list.setCurrentRow(0)
+        # Select first result
+        if self.results_model.result_count() > 0:
+            self._set_current_row(0)
 
-    def _on_selection_changed(self, row: int):
-        if 0 <= row < len(self._results_data):
-            path, is_dir, matches = self._results_data[row]
-            self._show_preview(path, is_dir, matches)
+    def _on_selection_changed(self, current: QModelIndex, previous: QModelIndex = None):
+        """Handle selection change in the list view."""
+        if not current.isValid():
+            return
+        row = current.row()
+        item = self.results_model.get_item(row)
+        if item:
+            path, is_dir, bookmark_name = item
+            self._last_selected_path = path  # Cache for resize debounce
+            self._show_preview(path, is_dir)
 
-    def _show_preview(self, path: str, is_dir: bool, matches: list):
+    def _show_preview(self, path: str, is_dir: bool):
         p = Path(path)
+
+        # Check file extension for special preview types
+        ext = p.suffix.lower().lstrip(".")
+
         if is_dir:
+            # Directory preview - show contents
+            self.preview_stack.setCurrentIndex(0)  # Text preview
             try:
                 items = sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
                 lines = ["📁 " + i.name if i.is_dir() else "   " + i.name for i in items[:80]]
-                self.preview.setPlainText("\n".join(lines) if lines else "(empty)")
+                self.preview_text.setPlainText("\n".join(lines) if lines else "(empty)")
             except Exception as e:
-                self.preview.setPlainText(f"Error: {e}")
+                self.preview_text.setPlainText(f"Error: {e}")
+
+        elif ext in IMAGE_EXTENSIONS:
+            # Image preview
+            self.preview_stack.setCurrentIndex(1)  # Image preview
+            try:
+                pixmap = QPixmap(path)
+                if not pixmap.isNull():
+                    # Scale to fit preview area while maintaining aspect ratio
+                    preview_width = self.preview_stack.width() - 20
+                    preview_height = self.preview_stack.height() - 20
+                    if preview_width > 50 and preview_height > 50:
+                        scaled = pixmap.scaled(
+                            preview_width, preview_height,
+                            Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+                        )
+                        self.preview_image_label.setPixmap(scaled)
+                    else:
+                        self.preview_image_label.setPixmap(pixmap)
+                else:
+                    self.preview_image_label.setText("(Cannot load image)")
+            except Exception as e:
+                self.preview_image_label.setText(f"Error: {e}")
+
+        elif ext == "pdf":
+            # PDF preview - render pages as images
+            self._show_pdf_preview(path)
+
         else:
             # Use smart preview based on file type
             category = get_file_category(path)
 
             if category == "audio":
-                self.preview.setPlainText(preview_audio(path))
+                self._show_audio_preview(path)
             elif category == "video":
-                self.preview.setPlainText(preview_video(path))
+                self.preview_stack.setCurrentIndex(0)  # Text preview
+                self.preview_text.setPlainText(preview_video(path))
             elif category == "archive":
-                self.preview.setPlainText(preview_archive(path))
+                self.preview_stack.setCurrentIndex(0)  # Text preview
+                self.preview_text.setPlainText(preview_archive(path))
             elif category == "binary":
-                self.preview.setPlainText(preview_binary(path))
+                self.preview_stack.setCurrentIndex(0)  # Text preview
+                self.preview_text.setPlainText(preview_binary(path))
             else:
                 # Text file - show contents
+                self.preview_stack.setCurrentIndex(0)  # Text preview
                 try:
                     with open(path, 'r', errors='replace') as f:
                         content = f.read(50000)
                         if len(content) >= 50000:
                             content += "\n\n... (truncated)"
-                        self.preview.setPlainText(content)
+                        self.preview_text.setPlainText(content)
                 except Exception as e:
-                    self.preview.setPlainText(f"Error: {e}")
+                    self.preview_text.setPlainText(f"Error: {e}")
 
-    def _on_double_click(self, item):
+    def _show_pdf_preview(self, path: str):
+        """Show PDF preview with scrollable pages."""
+        self.preview_stack.setCurrentIndex(2)  # PDF preview
+
+        # Clear existing pages
+        while self.preview_pdf_layout.count():
+            item = self.preview_pdf_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        try:
+            # Try using pdftoppm to render pages
+            import tempfile
+            import glob
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                # Convert PDF pages to images
+                result = subprocess.run(
+                    ["pdftoppm", "-png", "-r", "150", path, f"{tmpdir}/page"],
+                    capture_output=True, timeout=30
+                )
+
+                if result.returncode == 0:
+                    # Load all generated page images
+                    page_files = sorted(glob.glob(f"{tmpdir}/page-*.png"))
+                    if page_files:
+                        preview_width = self.preview_stack.width() - 40
+
+                        for page_file in page_files:
+                            pixmap = QPixmap(page_file)
+                            if not pixmap.isNull() and preview_width > 100:
+                                scaled = pixmap.scaledToWidth(
+                                    preview_width, Qt.TransformationMode.SmoothTransformation
+                                )
+                                label = QLabel()
+                                label.setPixmap(scaled)
+                                label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                                self.preview_pdf_layout.addWidget(label)
+
+                        # Add stretch at the end
+                        self.preview_pdf_layout.addStretch()
+                        return
+
+            # Fallback: show PDF info
+            self._show_pdf_info_fallback(path)
+
+        except FileNotFoundError:
+            self._show_pdf_info_fallback(path, "Install poppler-utils (pdftoppm) for PDF preview")
+        except subprocess.TimeoutExpired:
+            self._show_pdf_info_fallback(path, "PDF rendering timed out")
+        except Exception as e:
+            self._show_pdf_info_fallback(path, str(e))
+
+    def _show_pdf_info_fallback(self, path: str, error_msg: str = None):
+        """Show PDF info when rendering fails."""
+        self.preview_stack.setCurrentIndex(0)  # Switch to text preview
+        lines = ["━━━ PDF Document ━━━", ""]
+
+        p = Path(path)
+        try:
+            stat = p.stat()
+            size = stat.st_size
+            if size < 1024 * 1024:
+                size_str = f"{size / 1024:.1f} KB"
+            else:
+                size_str = f"{size / (1024 * 1024):.1f} MB"
+            lines.append(f"  File: {p.name}")
+            lines.append(f"  Size: {size_str}")
+        except:
+            pass
+
+        if error_msg:
+            lines.append("")
+            lines.append(f"  ({error_msg})")
+
+        self.preview_text.setPlainText("\n".join(lines))
+
+    def _show_audio_preview(self, path: str):
+        """Show audio preview with album art and metadata."""
+        self.preview_stack.setCurrentIndex(3)  # Audio preview
+
+        # Clear existing content
+        while self.preview_audio_layout.count():
+            item = self.preview_audio_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        preview_width = self.preview_stack.width() - 40
+        has_album_art = False
+
+        # Try to extract album art using ffmpeg
+        try:
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                tmp_path = tmp.name
+
+            # Extract embedded album art
+            result = subprocess.run(
+                ["ffmpeg", "-i", path, "-an", "-vcodec", "copy", "-y", tmp_path],
+                capture_output=True, timeout=5
+            )
+
+            if result.returncode == 0 and os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
+                pixmap = QPixmap(tmp_path)
+                if not pixmap.isNull() and preview_width > 100:
+                    # Scale album art to reasonable size
+                    max_art_size = min(preview_width, 300)
+                    scaled = pixmap.scaled(
+                        max_art_size, max_art_size,
+                        Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+                    )
+                    art_label = QLabel()
+                    art_label.setPixmap(scaled)
+                    art_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    art_label.setStyleSheet("QLabel { background: #1e1e1e; }")
+                    self.preview_audio_layout.addWidget(art_label)
+                    has_album_art = True
+
+            # Clean up temp file
+            try:
+                os.unlink(tmp_path)
+            except:
+                pass
+
+        except Exception:
+            pass
+
+        # Add metadata text
+        metadata_text = preview_audio(path)
+        metadata_label = QLabel(metadata_text)
+        metadata_label.setStyleSheet("""
+            QLabel {
+                background: #1e1e1e;
+                color: #bbb;
+                font-family: monospace;
+                font-size: 11px;
+                padding: 10px;
+            }
+        """)
+        metadata_label.setWordWrap(True)
+        self.preview_audio_layout.addWidget(metadata_label)
+
+        # Add stretch at the end
+        self.preview_audio_layout.addStretch()
+
+        # If no album art was found, show a note
+        if not has_album_art:
+            # The metadata is already shown, no need to add extra note
+            pass
+
+    def _on_double_click(self, index: QModelIndex):
         self._open_selected()
 
     def _open_selected(self):
-        row = self.list.currentRow()
-        if 0 <= row < len(self._results_data):
-            path, is_dir, _ = self._results_data[row]
+        row = self._get_current_row()
+        item = self.results_model.get_item(row)
+        if item:
+            path, is_dir, _ = item
             try:
                 if is_dir:
                     # Open folder in Dolphin
@@ -1340,9 +1786,10 @@ class NixNavWindow(QWidget):
                 self.status.setText(f"Error: {e}")
 
     def _open_folder(self):
-        row = self.list.currentRow()
-        if 0 <= row < len(self._results_data):
-            path, _, _ = self._results_data[row]
+        row = self._get_current_row()
+        item = self.results_model.get_item(row)
+        if item:
+            path, _, _ = item
             try:
                 subprocess.Popen(["dolphin", "--select", path], start_new_session=True)
                 self.close()
@@ -1350,35 +1797,42 @@ class NixNavWindow(QWidget):
             except Exception as e:
                 self.status.setText(f"Error: {e}")
 
-    def _rescan_bookmark(self):
-        """Rescan current bookmark's directory with real-time progress."""
+    def _rescan_all_bookmarks(self):
+        """Rescan all bookmarks' directories with progress."""
         import threading
 
-        path = self._get_path()
-        self.status.setText("Rescanning...")
+        bookmarks = self.config.get_bookmarks()
+        if not bookmarks:
+            return
+
+        self.status.setText("Rescanning all...")
         self.status.setStyleSheet("color: #e6a855; font-size: 11px;")  # Orange during scan
 
         def do_rescan():
+            total_indexed = 0
             try:
                 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 sock.settimeout(600)  # 10 min timeout for large directories
                 sock.connect(DAEMON_SOCKET)
-                sock.sendall(f"RESCAN {path}\n".encode())
 
-                response = b""
-                while b"\n" not in response:
-                    chunk = sock.recv(65536)
-                    if not chunk:
-                        break
-                    response += chunk
+                for bm in bookmarks:
+                    path = bm["path"]
+                    sock.sendall(f"RESCAN {path}\n".encode())
+
+                    response = b""
+                    while b"\n" not in response:
+                        chunk = sock.recv(65536)
+                        if not chunk:
+                            break
+                        response += chunk
+
+                    data = json.loads(response.decode().strip())
+                    total_indexed += data.get("indexed", 0)
 
                 sock.close()
 
-                data = json.loads(response.decode().strip())
-                indexed = data.get("indexed", 0)
-
                 # Update UI from main thread
-                QTimer.singleShot(0, lambda: self._on_rescan_complete(indexed))
+                QTimer.singleShot(0, lambda: self._on_rescan_complete(total_indexed))
 
             except Exception as e:
                 QTimer.singleShot(0, lambda: self._on_rescan_error(str(e)))

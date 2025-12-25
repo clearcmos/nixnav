@@ -48,9 +48,12 @@ nix build
 ## Key Features
 
 - **Instant search**: Trigram index enables sub-10ms search across 600k+ files
-- **Unified search**: Searches both files and directories in one query
+- **Unified search**: Searches all bookmarks simultaneously by default
+- **Bookmark filtering**: Use `bookmark-name:query` to search within a specific bookmark
 - **Smart previews**: Context-aware preview panel based on file type
-- **Bookmarks**: Configurable directories to search within
+- **Image previews**: Displays actual images (PNG, JPG, etc.) in the preview panel
+- **PDF previews**: Scrollable multi-page PDF rendering with pdftoppm
+- **Bookmarks**: Configurable directories to search within (managed via dialog)
 - **Auto-indexing**: Daemon auto-starts and indexes bookmarks on launch
 - **Real-time updates**: inotify watches for file changes
 - **Integrity checker**: Periodic verification catches bulk deletes
@@ -65,8 +68,15 @@ nix build
 | `Arrow Up/Down` | Navigate results |
 | `Enter` | Open file (xdg-open) or folder (Dolphin) |
 | `Ctrl+O` | Open containing folder in Dolphin |
-| `Ctrl+R` | Rescan current bookmark (refresh index) |
+| `Ctrl+R` | Rescan all bookmarks (refresh index) |
 | `Esc` | Close overlay |
+
+## Search Syntax
+
+- **Simple search**: Just type to search all bookmarks
+- **Bookmark filter**: `bookmark-name:query` searches only that bookmark
+- **Extension filter**: `*.py query` filters by file extension
+- **Combined**: `home:*.md readme` searches for "readme" in .md files under "home" bookmark
 
 ## Smart Preview System
 
@@ -75,13 +85,17 @@ The preview panel shows context-appropriate content based on file type:
 | File Type | Preview Shows |
 |-----------|--------------|
 | Directories | Folder contents listing |
+| Images (PNG, JPG, etc.) | Actual image display (scaled to fit) |
+| PDF files | Scrollable multi-page preview |
 | Text files | File contents (up to 50KB) |
 | Binary files | File info (name, size, type, dimensions for images) |
-| Audio (MP3, FLAC, etc.) | ID3 tags, duration, bitrate, codec, sample rate |
+| Audio (MP3, FLAC, etc.) | Album art (if embedded) + ID3 tags, duration, bitrate, codec |
 | Video (MKV, MP4, etc.) | Duration, resolution, frame rate, audio tracks, subtitles |
 | Archives (ZIP, TAR, etc.) | Contents listing with file sizes |
 
-Requires `ffprobe` (from ffmpeg) for audio/video metadata.
+Requires:
+- `ffprobe` (from ffmpeg) for audio/video metadata
+- `pdftoppm` (from poppler-utils) for PDF previews
 
 ## Data Locations
 
@@ -115,9 +129,11 @@ The daemon automatically excludes:
 
 ## Bookmark Management
 
-- **Add**: Click the + button next to the dropdown
-- **Rename/Delete**: Right-click on the bookmark dropdown for context menu
+- **Open Manager**: Click the "Bookmarks" button to open the management dialog
+- **Add**: Add new directories to search within
+- **Rename/Delete**: Manage existing bookmarks from the dialog
 - **Auto-sync**: Bookmarks are automatically indexed by daemon on launch
+- **Prefix Search**: Use `bookmark-name:query` to search within a specific bookmark
 
 ## IPC Protocol
 
@@ -134,9 +150,12 @@ Commands:
   PING -> {"status": "pong"}
   STATS -> {"files": N, "trigrams": N, "bookmarks": N}
   SEARCH {"bookmark_path": "...", "mode": "all", "query": "...", "extension": null}
+  SEARCH_ALL {"bookmark_paths": [...], "query": "...", "extension": null}  # Fast unified search
   RESCAN /path -> {"status": "ok", "indexed": N}
   ADD_BOOKMARK {"name": "...", "path": "...", "is_network": false}
 ```
+
+**SEARCH_ALL** is the fastest search method - it searches all bookmarks in a single pass through the trigram index, avoiding multiple socket round-trips.
 
 ## Wayland Considerations
 
