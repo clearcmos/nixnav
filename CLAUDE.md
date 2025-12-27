@@ -68,6 +68,7 @@ nix build
 | `Arrow Up/Down` | Navigate results |
 | `Enter` | Open file (xdg-open) or folder (Dolphin) |
 | `Ctrl+O` | Open containing folder in Dolphin |
+| `Ctrl+P` | Toggle preview pane |
 | `Ctrl+R` | Rescan all bookmarks (refresh index) |
 | `Esc` | Close overlay |
 
@@ -116,7 +117,9 @@ Requires:
   "last_bookmark": 0,
   "exclude_patterns": ["*.pyc", "__pycache__", ".git", "node_modules", "*.log", ".Trash*", "Trash"],
   "max_results": 500,
-  "window_geometry": "<base64 encoded Qt geometry>"
+  "window_geometry": "<base64 encoded Qt geometry>",
+  "splitter_sizes": [500, 500],
+  "preview_visible": true
 }
 ```
 

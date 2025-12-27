@@ -1153,11 +1153,22 @@ class NixNavWindow(QWidget):
         self.setup_ui()
         self.setup_shortcuts()
 
+        # Restore splitter position from config
+        splitter_sizes = self.config.data.get("splitter_sizes")
+        if splitter_sizes and isinstance(splitter_sizes, list) and len(splitter_sizes) == 2:
+            self.splitter.setSizes(splitter_sizes)
+
+        # Restore preview pane visibility (default: visible)
+        preview_visible = self.config.data.get("preview_visible", True)
+        self.preview_stack.setVisible(preview_visible)
+
     def closeEvent(self, event):
         """Clean up threads and save position on close."""
         self._cancel_scan()
         # Save window geometry (as base64 bytes for Qt's native format)
         self.config.data["window_geometry"] = self.saveGeometry().toBase64().data().decode()
+        # Save splitter position
+        self.config.data["splitter_sizes"] = self.splitter.sizes()
         self.config.save()
         super().closeEvent(event)
 
@@ -1295,7 +1306,7 @@ class NixNavWindow(QWidget):
         layout.addWidget(self.splitter, 1)
 
         # Help line
-        help_lbl = QLabel("Enter: Open | Ctrl+O: Open folder | Ctrl+R: Refresh all | bookmark:query to filter | Esc: Close")
+        help_lbl = QLabel("Enter: Open | Ctrl+O: Open folder | Ctrl+P: Toggle preview | Ctrl+R: Refresh | Esc: Close")
         help_lbl.setStyleSheet("color: #444; font-size: 10px;")
         help_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(help_lbl)
@@ -1323,6 +1334,14 @@ class NixNavWindow(QWidget):
     def setup_shortcuts(self):
         QShortcut(QKeySequence("Ctrl+O"), self).activated.connect(self._open_folder)
         QShortcut(QKeySequence("Ctrl+R"), self).activated.connect(self._rescan_all_bookmarks)
+        QShortcut(QKeySequence("Ctrl+P"), self).activated.connect(self._toggle_preview_pane)
+
+    def _toggle_preview_pane(self):
+        """Toggle preview pane visibility."""
+        visible = not self.preview_stack.isVisible()
+        self.preview_stack.setVisible(visible)
+        self.config.data["preview_visible"] = visible
+        self.config.save()
 
     def showEvent(self, event):
         super().showEvent(event)
